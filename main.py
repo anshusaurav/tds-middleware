@@ -22,10 +22,18 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/ping": (14, 10.0),
     "/orders": (20, 10.0),
     "/extract": (10_000, 10.0),
+    "/work": (10_000, 10.0),
+    "/metrics": (10_000, 10.0),
+    "/healthz": (10_000, 10.0),
+    "/logs": (10_000, 10.0),
 }
 DEFAULT_LIMIT: Tuple[int, float] = (20, 10.0)
 
 TOTAL_ORDERS = 46
+
+APP_START = time.monotonic()
+_REQUEST_COUNTER = 0
+_LOG_BUFFER: Deque[dict] = deque(maxlen=2000)
 
 app = FastAPI()
 
@@ -70,11 +78,27 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        global _REQUEST_COUNTER
+        _REQUEST_COUNTER += 1
+
         rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
         request.state.request_id = rid
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = rid
-        return response
+
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            response.headers["X-Request-ID"] = rid
+            return response
+        finally:
+            _LOG_BUFFER.append({
+                "level": "INFO" if status < 500 else "ERROR",
+                "ts": time.time(),
+                "path": request.url.path,
+                "request_id": rid,
+                "method": request.method,
+                "status": status,
+            })
 
 
 class ScopedCORSMiddleware(BaseHTTPMiddleware):
@@ -303,6 +327,37 @@ def _extract_amount(text: str) -> float:
         if 50 <= v <= 9050:
             return v
     return 0.0
+
+
+# ---------- Metrics / health / logs ----------
+@app.get("/work")
+async def work(n: int = Query(1, ge=0, le=1_000_000)):
+    total = 0
+    for i in range(n):
+        total += i
+    return {"email": EMAIL, "done": n}
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok", "uptime_s": max(0.0, time.monotonic() - APP_START)}
+
+
+@app.get("/metrics")
+async def metrics():
+    body = (
+        "# HELP http_requests_total Total HTTP requests handled by this service\n"
+        "# TYPE http_requests_total counter\n"
+        f"http_requests_total {_REQUEST_COUNTER}\n"
+    )
+    return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+@app.get("/logs/tail")
+async def logs_tail(limit: int = Query(50, ge=1, le=2000)):
+    if not _LOG_BUFFER:
+        return []
+    return list(_LOG_BUFFER)[-limit:]
 
 
 @app.post("/extract", response_model=ExtractResponse)
