@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
 EMAIL = "25f1002017@ds.study.iitm.ac.in"
+ANALYTICS_API_KEY = "ak_n6jqafr50nenrfru11eevksj"
 
 ALLOWED_ORIGINS = {
     "https://app-b3lmdj.example.com",
@@ -26,6 +27,7 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/metrics": (10_000, 10.0),
     "/healthz": (10_000, 10.0),
     "/logs": (10_000, 10.0),
+    "/analytics": (10_000, 10.0),
 }
 DEFAULT_LIMIT: Tuple[int, float] = (20, 10.0)
 
@@ -112,7 +114,7 @@ class ScopedCORSMiddleware(BaseHTTPMiddleware):
                     "Access-Control-Allow-Origin": origin,
                     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                     "Access-Control-Allow-Headers":
-                        "X-Request-ID, X-Client-Id, Idempotency-Key, Content-Type",
+                        "X-Request-ID, X-Client-Id, Idempotency-Key, X-API-Key, Content-Type",
                     "Access-Control-Expose-Headers": "X-Request-ID, Retry-After",
                     "Access-Control-Max-Age": "600",
                     "Vary": "Origin",
@@ -379,3 +381,48 @@ async def extract(req: ExtractRequest):
             currency="USD",
             date="2026-01-01",
         )
+
+
+# ---------- Analytics ----------
+@app.post("/analytics")
+async def analytics(request: Request):
+    if request.headers.get("X-API-Key") != ANALYTICS_API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    events = payload.get("events") if isinstance(payload, dict) else None
+    if not isinstance(events, list):
+        events = []
+
+    users = set()
+    user_totals: Dict[str, float] = defaultdict(float)
+    revenue = 0.0
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        u = e.get("user")
+        if u is not None:
+            users.add(u)
+        a = e.get("amount")
+        if isinstance(a, bool):
+            continue
+        if isinstance(a, (int, float)) and a > 0:
+            revenue += float(a)
+            if u is not None:
+                user_totals[u] += float(a)
+
+    top_user = ""
+    if user_totals:
+        top_user = max(user_totals.items(), key=lambda kv: kv[1])[0]
+
+    return {
+        "email": EMAIL,
+        "total_events": len(events),
+        "unique_users": len(users),
+        "revenue": revenue,
+        "top_user": top_user,
+    }
