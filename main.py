@@ -1008,36 +1008,15 @@ def _sniff_audio_format(audio_bytes: bytes) -> str:
 async def _transcribe_via_aipipe(audio_bytes: bytes, token: str) -> str:
     """Try several AI-Pipe-compatible transcription paths; raise if all fail."""
     fmt = _sniff_audio_format(audio_bytes)
-    b64 = base64.b64encode(audio_bytes).decode()
     errors = []
 
-    # Attempt 1: JSON body to /audio/transcriptions (AI Pipe's error told us to do this)
-    for model_name in ("whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"):
-        payload = {
-            "model": model_name,
-            "file": b64,
-            "language": "ko",
-            "response_format": "json",
-        }
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                r = await client.post(
-                    f"{AIPIPE_BASE}/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {token}",
-                             "Content-Type": "application/json"},
-                    json=payload,
-                )
-            if r.status_code < 400:
-                try:
-                    return r.json().get("text", "") or r.text
-                except Exception:
-                    return r.text or ""
-            errors.append(f"{model_name} json: {r.status_code} {r.text[:200]}")
-        except Exception as e:
-            errors.append(f"{model_name} json: {e}")
-
-    # Attempt 2: multipart form to /audio/transcriptions
-    for model_name in ("whisper-1", "gpt-4o-mini-transcribe"):
+    # AI Pipe's audio/transcriptions expects multipart AND a model it can price.
+    # Modern gpt-4o transcribe models have pricing configured; whisper-1 does not.
+    for model_name in (
+        "gpt-4o-mini-transcribe",
+        "gpt-4o-transcribe",
+        "whisper-1",
+    ):
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 r = await client.post(
@@ -1051,11 +1030,11 @@ async def _transcribe_via_aipipe(audio_bytes: bytes, token: str) -> str:
                     return r.json().get("text", "") or r.text
                 except Exception:
                     return r.text or ""
-            errors.append(f"{model_name} multipart: {r.status_code} {r.text[:200]}")
+            errors.append(f"{model_name} multipart: {r.status_code} {r.text[:400]}")
         except Exception as e:
             errors.append(f"{model_name} multipart: {e}")
 
-    raise RuntimeError(" | ".join(errors)[:800])
+    raise RuntimeError(" || ".join(errors)[:3000])
 
 
 async def _parse_table_via_llm(transcription: str, token: str) -> dict:
@@ -1204,7 +1183,7 @@ async def _handle_audio_analyze(request: Request):
         transcription = await _transcribe_via_aipipe(audio_bytes, token)
         dbg["transcription"] = (transcription or "")[:1000]
     except Exception as e:
-        dbg["error"] = f"whisper: {str(e)[:400]}"
+        dbg["error"] = f"whisper: {str(e)}"[:3000]
         return _empty_audio_response()
 
     if not transcription.strip():
