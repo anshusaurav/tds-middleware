@@ -814,7 +814,17 @@ def _coerce_value(value, target: str):
     t = _TYPE_ALIASES.get((target or "").strip().lower(), "string")
 
     if t == "string":
-        return str(value)
+        s = str(value).strip()
+        # Trailing sentence punctuation: strip
+        s = re.sub(r"[.!?;,]+$", "", s).strip()
+        # Wrapping quotes: strip
+        s = s.strip("\"'`")
+        # Leading article ("The ", "A ", "An ") only when followed by a
+        # lowercase word — that pattern is a sentence, not a proper name.
+        m = re.match(r"^(the|a|an)\s+(\S+)", s, re.IGNORECASE)
+        if m and m.group(2)[:1].islower():
+            s = s[m.end() - len(m.group(2)):]
+        return s
 
     if t == "integer":
         if isinstance(value, bool):
@@ -894,7 +904,11 @@ async def dynamic_extract(request: Request):
         "  2. Use JSON null for any field you cannot find in the text.\n"
         "  3. Match types exactly: string -> JSON string, integer -> JSON integer, "
         "float -> JSON number, boolean -> JSON true/false, date -> JSON string in YYYY-MM-DD format.\n"
-        "  4. Do NOT include units, currency symbols, or extra text in values.\n"
+        "  4. For string values, return the CANONICAL value only:\n"
+        "     - no leading articles (do not start with 'The', 'A', or 'An') unless the article is part of a proper name;\n"
+        "     - no trailing punctuation (no period, comma, exclamation, question mark);\n"
+        "     - no wrapping quotes;\n"
+        "     - no units, currency symbols, labels, or explanatory text.\n"
         "  5. Output ONLY the JSON object, no explanation, no markdown fences."
     )
     user_prompt = f"TEXT:\n{text}\n\nSCHEMA (key: type):\n{schema_desc}\n\nReturn the JSON object."
