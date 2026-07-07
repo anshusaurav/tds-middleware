@@ -513,11 +513,38 @@ def _first_float(match) -> Optional[float]:
 
 
 def _extract_subtotal_and_tax(text: str):
-    tax = _first_float(_TAX_RE.search(text))
-    subtotal = _first_float(_SUBTOTAL_RE.search(text))
+    # Sum all tax matches so that CGST + SGST (and similar splits) combine correctly.
+    # Skip lines whose label starts with "total" — those would double-count the sum.
+    tax_amounts = []
+    for m in _TAX_RE.finditer(text):
+        span = text[max(0, m.start() - 20): m.start() + 10].lower()
+        if "total tax" in span or "total gst" in span or "total vat" in span:
+            continue
+        try:
+            v = float(m.group(1).replace(",", ""))
+            if v > 0:
+                tax_amounts.append(v)
+        except (ValueError, AttributeError):
+            pass
+    tax = round(sum(tax_amounts), 2) if tax_amounts else None
+
+    # Prefer the LAST subtotal match (summary line usually comes after line items).
+    subtotal = None
+    for m in _SUBTOTAL_RE.finditer(text):
+        try:
+            subtotal = float(m.group(1).replace(",", ""))
+        except (ValueError, AttributeError):
+            pass
     if subtotal is not None:
         return subtotal, tax
-    total = _first_float(_TOTAL_RE_STRICT.search(text))
+
+    # Same treatment for total: last match wins.
+    total = None
+    for m in _TOTAL_RE_STRICT.finditer(text):
+        try:
+            total = float(m.group(1).replace(",", ""))
+        except (ValueError, AttributeError):
+            pass
     if total is not None and tax is not None:
         return round(total - tax, 2), tax
     if total is not None:
