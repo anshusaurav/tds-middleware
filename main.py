@@ -371,25 +371,225 @@ async def logs_tail(limit: int = Query(50, ge=1, le=2000)):
     return list(_LOG_BUFFER)[-limit:]
 
 
-@app.post("/extract", response_model=ExtractResponse)
-async def extract(req: ExtractRequest):
-    text = (req.text or "").strip()
-    if not text:
-        raise HTTPException(status_code=422, detail="text is required")
+# ---------- New 6-field invoice extractor (fixed-schema) ----------
+_MONTHS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2,
+    "mar": 3, "march": 3, "apr": 4, "april": 4,
+    "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+_MONTH_ALT = "|".join(sorted(_MONTHS.keys(), key=len, reverse=True))
+
+_ISO_DATE_RE = re.compile(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b")
+_DMY_RE = re.compile(r"\b(\d{1,2})[-/](\d{1,2})[-/](20\d{2})\b")
+_DAY_MONTH_YEAR_RE = re.compile(
+    rf"\b(\d{{1,2}})[\s\-]+({_MONTH_ALT})[a-z]*[\s\-,]+(20\d{{2}})\b",
+    re.IGNORECASE,
+)
+_MONTH_DAY_YEAR_RE = re.compile(
+    rf"\b({_MONTH_ALT})[a-z]*[\s\-]+(\d{{1,2}})(?:st|nd|rd|th)?[\s\-,]+(20\d{{2}})\b",
+    re.IGNORECASE,
+)
+
+
+def _iso(y: int, mo: int, d: int) -> Optional[str]:
+    if 1 <= mo <= 12 and 1 <= d <= 31:
+        return f"{y:04d}-{mo:02d}-{d:02d}"
+    return None
+
+
+def _extract_iso_date(text: str) -> Optional[str]:
+    m = _ISO_DATE_RE.search(text)
+    if m:
+        r = _iso(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if r:
+            return r
+    m = _DAY_MONTH_YEAR_RE.search(text)
+    if m:
+        r = _iso(int(m.group(3)), _MONTHS[m.group(2).lower()], int(m.group(1)))
+        if r:
+            return r
+    m = _MONTH_DAY_YEAR_RE.search(text)
+    if m:
+        r = _iso(int(m.group(3)), _MONTHS[m.group(1).lower()], int(m.group(2)))
+        if r:
+            return r
+    m = _DMY_RE.search(text)
+    if m:
+        r = _iso(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        if r:
+            return r
+    return None
+
+
+_INV_LABEL_RE = re.compile(
+    r"(?:invoice\s*(?:no\.?|number|#|id)|inv\.?\s*(?:no\.?|#))\s*[:=#\-]?\s*([A-Z0-9][A-Z0-9\-_/]*)",
+    re.IGNORECASE,
+)
+_INV_PATTERN_RE = re.compile(r"\b(INV[-_/]\w+(?:[-_/]\w+)*)\b", re.IGNORECASE)
+
+
+def _extract_invoice_no(text: str) -> Optional[str]:
+    m = _INV_LABEL_RE.search(text)
+    if m:
+        return m.group(1).strip().rstrip(".,;:")
+    m = _INV_PATTERN_RE.search(text)
+    if m:
+        return m.group(1).strip().rstrip(".,;:")
+    return None
+
+
+_SUBTOTAL_RE = re.compile(
+    r"\b(?:sub[\s\-]?total|subtotal|net\s*amount|net\s*total|taxable\s*amount|"
+    r"amount\s*(?:before\s*tax)?|base\s*amount)\s*[:=\-]?\s*"
+    r"(?:[\$€£₹]|Rs\.?|INR|USD|EUR|GBP)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+    re.IGNORECASE,
+)
+_TOTAL_RE_STRICT = re.compile(
+    r"(?<![A-Za-z])(?:grand\s*total|invoice\s*total|total(?:\s*amount)?|"
+    r"amount\s*due|balance\s*due|amount\s*payable)"
+    r"\s*[:=\-]?\s*(?:[\$€£₹]|Rs\.?|INR|USD|EUR|GBP)?\s*"
+    r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+    re.IGNORECASE,
+)
+_TAX_RE = re.compile(
+    r"\b(?:tax|gst|vat|cgst|sgst|igst|service\s*tax|sales\s*tax)"
+    r"(?:\s*\(\s*\d+(?:\.\d+)?\s*%?\s*\))?\s*[:=\-]?\s*"
+    r"(?:[\$€£₹]|Rs\.?|INR|USD|EUR|GBP)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+    re.IGNORECASE,
+)
+
+
+def _first_float(match) -> Optional[float]:
+    if not match:
+        return None
     try:
-        return ExtractResponse(
-            vendor=_extract_vendor(text),
-            amount=_extract_amount(text),
-            currency=_extract_currency(text),
-            date=_extract_date(text),
-        )
+        return float(match.group(1).replace(",", ""))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _extract_subtotal_and_tax(text: str):
+    tax = _first_float(_TAX_RE.search(text))
+    subtotal = _first_float(_SUBTOTAL_RE.search(text))
+    if subtotal is not None:
+        return subtotal, tax
+    total = _first_float(_TOTAL_RE_STRICT.search(text))
+    if total is not None and tax is not None:
+        return round(total - tax, 2), tax
+    if total is not None:
+        return total, tax
+    return None, tax
+
+
+_CURRENCY_NEW_RE = re.compile(
+    r"\b(USD|EUR|GBP|INR|JPY|AUD|CAD|CHF|CNY|SGD|HKD|NZD|SEK|NOK|DKK|"
+    r"ZAR|MXN|BRL|AED|SAR|RUB|KRW|TRY)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_currency_new(text: str) -> Optional[str]:
+    m = _CURRENCY_NEW_RE.search(text)
+    if m:
+        return m.group(1).upper()
+    if re.search(r"\bRs\.?\b|₹", text):
+        return "INR"
+    if "€" in text:
+        return "EUR"
+    if "£" in text:
+        return "GBP"
+    if "¥" in text:
+        return "JPY"
+    if "$" in text:
+        return "USD"
+    return None
+
+
+_VENDOR_LABEL_NEW_RE = re.compile(
+    r"^\s*(?:vendor|from|bill\s*from|company|seller|supplier|billed\s*by|billed\s*from|bill\s*to)"
+    r"\s*[:\-]\s*(.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _extract_vendor_new(text: str) -> Optional[str]:
+    m = _VENDOR_LABEL_NEW_RE.search(text)
+    if m:
+        v = m.group(1).strip().rstrip(".,;:")
+        if v:
+            return v
+    m = _VENDOR_SUFFIX_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+class ExtractInvoiceResponse(BaseModel):
+    invoice_no: Optional[str] = None
+    date: Optional[str] = None
+    vendor: Optional[str] = None
+    amount: Optional[float] = None
+    tax: Optional[float] = None
+    currency: Optional[str] = None
+
+
+def _extract_invoice_new(text: str) -> dict:
+    subtotal, tax = _extract_subtotal_and_tax(text)
+    return {
+        "invoice_no": _extract_invoice_no(text),
+        "date": _extract_iso_date(text),
+        "vendor": _extract_vendor_new(text),
+        "amount": subtotal,
+        "tax": tax,
+        "currency": _extract_currency_new(text),
+    }
+
+
+@app.post("/extract")
+async def extract(request: Request):
+    try:
+        body = await request.json()
     except Exception:
-        return ExtractResponse(
-            vendor="Unknown Vendor",
-            amount=0.0,
-            currency="USD",
-            date="2026-01-01",
-        )
+        raise HTTPException(status_code=422, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
+
+    # Dispatch by which key the caller sent
+    if "invoice_text" in body:
+        text = str(body.get("invoice_text") or "").strip()
+        if not text:
+            return ExtractInvoiceResponse().model_dump()
+        try:
+            return _extract_invoice_new(text)
+        except Exception:
+            return ExtractInvoiceResponse().model_dump()
+
+    if "text" in body:
+        text = str(body.get("text") or "").strip()
+        if not text:
+            raise HTTPException(status_code=422, detail="text is required")
+        try:
+            return {
+                "vendor": _extract_vendor(text),
+                "amount": _extract_amount(text),
+                "currency": _extract_currency(text),
+                "date": _extract_date(text),
+            }
+        except Exception:
+            return {
+                "vendor": "Unknown Vendor",
+                "amount": 0.0,
+                "currency": "USD",
+                "date": "2026-01-01",
+            }
+
+    raise HTTPException(
+        status_code=422,
+        detail="body must contain either 'text' or 'invoice_text'",
+    )
 
 
 # ---------- Analytics ----------
