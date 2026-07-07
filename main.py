@@ -446,18 +446,36 @@ _MONTH_PREFIXES = {
 }
 
 
+_LABEL_WORDS = {
+    "invoice", "inv", "bill", "receipt", "order", "reference", "ref",
+    "document", "doc", "voucher", "po", "no", "number", "num", "id",
+}
+
+
+def _looks_like_invoice_no(cand: str) -> bool:
+    if not cand:
+        return False
+    if cand.lower() in _LABEL_WORDS:
+        return False
+    # Real invoice numbers have either a digit or a separator (or both).
+    # Bare-word matches like "Ref" have neither and should be rejected.
+    has_digit = any(ch.isdigit() for ch in cand)
+    has_sep = any(ch in "-_/" for ch in cand)
+    return has_digit or has_sep
+
+
 def _extract_invoice_no(text: str) -> Optional[str]:
-    m = _INV_LABEL_RE.search(text)
-    if m:
-        v = m.group(1).strip().rstrip(".,;:")
-        if v:
-            return v
+    for m in _INV_LABEL_RE.finditer(text):
+        cand = m.group(1).strip().rstrip(".,;:")
+        if _looks_like_invoice_no(cand):
+            return cand
     for m in _INV_STANDALONE_RE.finditer(text):
         v = m.group(1).strip().rstrip(".,;:")
         head = re.split(r"[-_/]", v, 1)[0].upper()
         if head in _CURRENCY_PREFIXES or head in _MONTH_PREFIXES:
             continue
-        return v
+        if _looks_like_invoice_no(v):
+            return v
     return None
 
 
