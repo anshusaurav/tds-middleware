@@ -974,16 +974,16 @@ def _empty_audio_response():
         "rows": 0,
         "columns": [],
         "mean": {},
-        "std": [],
+        "std": {},
         "variance": {},
         "min": {},
         "max": {},
-        "median": [],
+        "median": {},
         "mode": {},
         "range": {},
         "allowed_values": {},
-        "value_range": [],
-        "correlation": [],
+        "value_range": {},
+        "correlation": {},
     }
 
 
@@ -1026,20 +1026,20 @@ async def _gemini_audio_to_table(audio_bytes: bytes) -> dict:
         "a dataset (row count, column names, per-column stats — NOT the "
         "individual row values themselves).\n\n"
         "Listen carefully and return exactly ONE JSON object with these keys "
-        "(use null / [] / {} if a value is not stated in the audio):\n"
+        "(use 0 / [] / {} if a value is not stated in the audio):\n"
         "  rows: integer, the total row count stated in the audio\n"
         "  columns: ordered list of column names (keep the original Korean)\n"
         "  mean: {column_name: mean_value} for each numeric column\n"
-        "  std: [std_value, ...] in the order of numeric columns\n"
+        "  std: {column_name: std_value} for each numeric column\n"
         "  variance: {column_name: variance_value}\n"
         "  min: {column_name: min_value}\n"
         "  max: {column_name: max_value}\n"
-        "  median: [median_value, ...] in the order of numeric columns\n"
+        "  median: {column_name: median_value}\n"
         "  mode: {column_name: mode_value}\n"
         "  range: {column_name: range_value}\n"
         "  allowed_values: {column_name: [allowed values]} for categorical columns\n"
-        "  value_range: [[min, max], ...] in the order of numeric columns\n"
-        "  correlation: correlation matrix as list of lists between numeric columns\n"
+        "  value_range: {column_name: [min, max]}\n"
+        "  correlation: {column_name: {other_column_name: correlation_value}}\n"
         "  transcription: the verbatim Korean transcription\n\n"
         "Numeric values must be JSON numbers, not strings. Do NOT invent values "
         "that aren't stated. Output ONLY the JSON, no explanation, no fences."
