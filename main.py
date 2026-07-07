@@ -1005,59 +1005,72 @@ def _sniff_audio_format(audio_bytes: bytes) -> str:
     return "mp3"  # safest default given AI Pipe's payload
 
 
-OPENROUTER_BASE = "https://aipipe.org/openrouter/v1"
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
-async def _gemini_audio_to_table(audio_bytes: bytes, token: str) -> dict:
-    """Use Gemini 2.5 Flash via OpenRouter (audio-input capable) to transcribe the
-    Korean audio AND parse the described table in one call. Returns
+async def _gemini_audio_to_table(audio_bytes: bytes) -> dict:
+    """Call Google Gemini API directly with GEMINI_API_KEY. Does audio
+    transcription + table parsing in a single call. Returns
     {'columns': [...], 'data': [...], 'transcription': '...'}."""
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY not set on server")
+
     fmt = _sniff_audio_format(audio_bytes)
+    mime = {"mp3": "audio/mp3", "wav": "audio/wav", "ogg": "audio/ogg",
+            "flac": "audio/flac", "m4a": "audio/mp4"}.get(fmt, "audio/mp3")
     b64 = base64.b64encode(audio_bytes).decode()
 
     prompt = (
-        "The audio is in Korean and describes a small tabular dataset. Do BOTH: "
-        "(1) transcribe the audio verbatim, and "
-        "(2) extract the table it describes. "
-        "Return ONE JSON object with exactly these three keys: "
-        "'transcription' (string, verbatim Korean text), "
-        "'columns' (ordered list of column names in the original language), "
-        "'data' (list of row objects mapping column name to value; "
-        "numeric values as JSON numbers, categorical as JSON strings). "
-        "Output ONLY the JSON, no explanation, no markdown."
+        "The audio is in Korean and describes a small tabular dataset. "
+        "Do BOTH tasks:\n"
+        "1) Transcribe the audio verbatim.\n"
+        "2) Extract the table it describes.\n\n"
+        "Return exactly ONE JSON object with three keys:\n"
+        "  transcription: string, verbatim Korean text\n"
+        "  columns: ordered list of column names in the original Korean\n"
+        "  data: list of row objects mapping column name to value; "
+        "numeric values as JSON numbers, categorical as JSON strings\n\n"
+        "Output ONLY the JSON, no explanation, no markdown fences."
     )
 
     payload = {
-        "model": "google/gemini-2.5-flash",
-        "messages": [
-            {"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "input_audio", "input_audio": {"data": b64, "format": fmt}},
-            ]}
-        ],
-        "response_format": {"type": "json_object"},
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime, "data": b64}},
+            ]
+        }],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0,
+        },
     }
 
     errors = []
-    for model_name in ("google/gemini-2.5-flash", "google/gemini-2.5-pro"):
-        payload["model"] = model_name
+    for model_name in ("gemini-2.5-flash", "gemini-2.5-pro"):
+        url = f"{GEMINI_BASE}/models/{model_name}:generateContent?key={key}"
         try:
             async with httpx.AsyncClient(timeout=180.0) as client:
                 r = await client.post(
-                    f"{OPENROUTER_BASE}/chat/completions",
-                    headers={"Authorization": f"Bearer {token}",
-                             "Content-Type": "application/json"},
+                    url,
+                    headers={"Content-Type": "application/json"},
                     json=payload,
                 )
             if r.status_code >= 400:
                 errors.append(f"{model_name}: {r.status_code} {r.text[:300]}")
                 continue
-            content = r.json()["choices"][0]["message"].get("content") or ""
-            raw = str(content).strip()
-            if raw.startswith("```"):
-                raw = re.sub(r"^```(?:json)?\s*", "", raw)
-                raw = re.sub(r"\s*```$", "", raw)
-            parsed = _json.loads(raw)
+            body = r.json()
+            parts = (body.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+            content = ""
+            for p in parts:
+                if "text" in p:
+                    content += p["text"]
+            content = content.strip()
+            if content.startswith("```"):
+                content = re.sub(r"^```(?:json)?\s*", "", content)
+                content = re.sub(r"\s*```$", "", content)
+            parsed = _json.loads(content)
             if not isinstance(parsed, dict):
                 errors.append(f"{model_name}: non-dict content")
                 continue
@@ -1211,7 +1224,7 @@ async def _handle_audio_analyze(request: Request):
         return _empty_audio_response()
 
     try:
-        table = await _gemini_audio_to_table(audio_bytes, token)
+        table = await _gemini_audio_to_table(audio_bytes)
         dbg["transcription"] = str(table.get("transcription", ""))[:1000]
         dbg["table"] = {"columns": table.get("columns"),
                         "data": table.get("data")}
