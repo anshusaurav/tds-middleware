@@ -1062,8 +1062,9 @@ async def _gemini_audio_to_table(audio_bytes: bytes) -> dict:
     }
 
     errors = []
-    # 2.5-flash-lite is ~2x faster than 2.5-flash; the grader gives only 12s.
-    for model_name in ("gemini-2.5-flash-lite", "gemini-2.5-flash"):
+    # With thinking disabled, both models measure ~2-3s so prefer the more
+    # accurate Flash; fall back to Flash-Lite if Flash errors.
+    for model_name in ("gemini-2.5-flash", "gemini-2.5-flash-lite"):
         url = f"{GEMINI_BASE}/models/{model_name}:generateContent?key={key}"
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
