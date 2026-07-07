@@ -22,7 +22,7 @@ ALLOWED_ORIGINS = {
 
 # Paths that must accept any origin (grader sends from a Cloudflare Worker
 # whose subdomain isn't fixed). CORS reflects whatever Origin arrives.
-PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract")
+PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats")
 
 # (limit, window_seconds) keyed by path prefix; longest prefix wins.
 PATH_LIMITS: Dict[str, Tuple[int, float]] = {
@@ -36,6 +36,8 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/analytics": (10_000, 10.0),
     "/answer-image": (10_000, 10.0),
     "/dynamic-extract": (10_000, 10.0),
+    "/audio-analyze": (10_000, 10.0),
+    "/audio-stats": (10_000, 10.0),
 }
 DEFAULT_LIMIT: Tuple[int, float] = (20, 10.0)
 
@@ -964,3 +966,185 @@ async def dynamic_extract(request: Request):
         raw_v = parsed.get(key)
         result[key] = _coerce_value(raw_v, tname)
     return result
+
+
+# ---------- Audio dataset analyzer (Korean audio -> statistics) ----------
+def _empty_audio_response():
+    return {
+        "rows": 0,
+        "columns": [],
+        "mean": {},
+        "std": [],
+        "variance": {},
+        "min": {},
+        "max": {},
+        "median": [],
+        "mode": {},
+        "range": {},
+        "allowed_values": {},
+        "value_range": [],
+        "correlation": [],
+    }
+
+
+async def _transcribe_via_aipipe(audio_bytes: bytes, token: str) -> str:
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        r = await client.post(
+            f"{AIPIPE_BASE}/audio/transcriptions",
+            headers={"Authorization": f"Bearer {token}"},
+            files={"file": ("audio.wav", audio_bytes, "audio/wav")},
+            data={"model": "whisper-1", "language": "ko"},
+        )
+    if r.status_code >= 400:
+        raise RuntimeError(f"whisper {r.status_code}: {r.text[:400]}")
+    return r.json().get("text", "")
+
+
+async def _parse_table_via_llm(transcription: str, token: str) -> dict:
+    system_prompt = (
+        "You parse a Korean audio transcription that describes a small tabular dataset "
+        "and extract it as JSON. Return an object with exactly two keys: "
+        "'columns' (ordered list of column names, string) and "
+        "'data' (list of row objects; each row maps column name to its value; "
+        "numeric values as JSON numbers, categorical as JSON strings). "
+        "Return null values for missing cells. Output ONLY the JSON object, no explanation."
+    )
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Transcription:\n{transcription}\n\nReturn the JSON."},
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(
+            f"{AIPIPE_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=payload,
+        )
+    if r.status_code >= 400:
+        raise RuntimeError(f"gpt {r.status_code}: {r.text[:400]}")
+    content = r.json()["choices"][0]["message"]["content"]
+    raw = str(content).strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    return _json.loads(raw)
+
+
+def _compute_stats(table: dict) -> dict:
+    import numpy as _np
+    import pandas as _pd
+
+    columns = list(table.get("columns", []))
+    data = table.get("data", []) or []
+    if not columns or not data:
+        return _empty_audio_response()
+
+    df = _pd.DataFrame(data, columns=columns)
+    numeric_cols = [c for c in columns if _pd.api.types.is_numeric_dtype(df[c])]
+    # Coerce columns that LOOK numeric (strings of digits) to numeric
+    for c in columns:
+        if c not in numeric_cols:
+            coerced = _pd.to_numeric(df[c], errors="coerce")
+            if coerced.notna().all():
+                df[c] = coerced
+                numeric_cols.append(c)
+    numeric_cols = [c for c in columns if c in numeric_cols]  # preserve order
+    categorical_cols = [c for c in columns if c not in numeric_cols]
+
+    def _num(v):
+        try:
+            f = float(v)
+            if _np.isnan(f) or _np.isinf(f):
+                return None
+            return f
+        except Exception:
+            return None
+
+    mean = {c: _num(df[c].mean()) for c in numeric_cols}
+    variance = {c: _num(df[c].var(ddof=0)) for c in numeric_cols}
+    minimum = {c: _num(df[c].min()) for c in numeric_cols}
+    maximum = {c: _num(df[c].max()) for c in numeric_cols}
+    range_ = {c: _num(df[c].max() - df[c].min()) for c in numeric_cols}
+
+    std_list = [_num(df[c].std(ddof=0)) for c in numeric_cols]
+    median_list = [_num(df[c].median()) for c in numeric_cols]
+    value_range_list = [[_num(df[c].min()), _num(df[c].max())] for c in numeric_cols]
+
+    mode = {}
+    for c in columns:
+        modes = df[c].mode(dropna=True)
+        if len(modes) > 0:
+            v = modes.iloc[0]
+            mode[c] = _num(v) if c in numeric_cols else str(v)
+
+    allowed_values = {}
+    for c in categorical_cols:
+        allowed_values[c] = sorted({str(v) for v in df[c].dropna().tolist()})
+
+    if len(numeric_cols) >= 2:
+        corr_df = df[numeric_cols].corr()
+        correlation = [[_num(corr_df.iloc[i, j]) for j in range(len(numeric_cols))]
+                       for i in range(len(numeric_cols))]
+    else:
+        correlation = []
+
+    return {
+        "rows": int(len(df)),
+        "columns": columns,
+        "mean": mean,
+        "std": std_list,
+        "variance": variance,
+        "min": minimum,
+        "max": maximum,
+        "median": median_list,
+        "mode": mode,
+        "range": range_,
+        "allowed_values": allowed_values,
+        "value_range": value_range_list,
+        "correlation": correlation,
+    }
+
+
+async def _handle_audio_analyze(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
+
+    audio_b64 = body.get("audio_base64", "")
+    if not audio_b64:
+        return _empty_audio_response()
+
+    token = os.environ.get("AIPIPE_TOKEN", "").strip()
+    if not token:
+        return _empty_audio_response()
+
+    try:
+        audio_bytes = base64.b64decode(audio_b64)
+    except Exception:
+        return _empty_audio_response()
+
+    try:
+        transcription = await _transcribe_via_aipipe(audio_bytes, token)
+        if not transcription.strip():
+            return _empty_audio_response()
+        table = await _parse_table_via_llm(transcription, token)
+        return _compute_stats(table)
+    except Exception:
+        return _empty_audio_response()
+
+
+@app.post("/audio-analyze")
+async def audio_analyze(request: Request):
+    return await _handle_audio_analyze(request)
+
+
+@app.post("/audio-stats")
+async def audio_stats(request: Request):
+    return await _handle_audio_analyze(request)
