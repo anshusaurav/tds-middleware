@@ -1250,6 +1250,22 @@ async def _handle_audio_analyze(request: Request):
         if v is None:
             continue
         result[k] = v
+
+    # Safety net: if columns is empty but the per-column dicts have keys,
+    # derive columns from their union (preserving Gemini's key order).
+    if not result["columns"]:
+        derived = []
+        seen = set()
+        for field in ("mean", "std", "variance", "min", "max", "median",
+                      "mode", "range", "value_range", "allowed_values"):
+            d = result.get(field)
+            if isinstance(d, dict):
+                for key in d.keys():
+                    if key not in seen:
+                        seen.add(key)
+                        derived.append(key)
+        result["columns"] = derived
+
     dbg["stats"] = result
     return result
 
