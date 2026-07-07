@@ -1039,7 +1039,7 @@ async def _gemini_audio_to_table(audio_bytes: bytes) -> dict:
         "  range: {column_name: range_value}\n"
         "  allowed_values: {column_name: [allowed values]} for categorical columns\n"
         "  value_range: {column_name: [min, max]}\n"
-        "  correlation: {column_name: {other_column_name: correlation_value}}\n"
+        "  correlation: list of [column_a, column_b, correlation_value] triples\n"
         "  transcription: the verbatim Korean transcription\n\n"
         "Numeric values must be JSON numbers, not strings. Do NOT invent values "
         "that aren't stated. Output ONLY the JSON, no explanation, no fences."
@@ -1243,12 +1243,22 @@ async def _handle_audio_analyze(request: Request):
         return _empty_audio_response()
 
     # Gemini directly extracts the statistical specs from the audio.
-    # Merge onto the empty shape so all 13 keys are always present.
-    result = _empty_audio_response()
+    # Merge onto the empty shape so all 13 keys are always present, and
+    # enforce the shape (list vs dict) of each field regardless of what
+    # Gemini produced.
+    empty = _empty_audio_response()
+    result = dict(empty)
     for k in result.keys():
         v = parsed.get(k, None)
         if v is None:
             continue
+        expected = empty[k]
+        if isinstance(expected, list) and not isinstance(v, list):
+            # coerce dict -> list of values (drops keys but preserves values)
+            v = list(v.values()) if isinstance(v, dict) else [v]
+        elif isinstance(expected, dict) and not isinstance(v, dict):
+            # can't rebuild keys from a bare list; fall back to empty
+            v = {}
         result[k] = v
 
     # Safety net: if columns is empty but the per-column dicts have keys,
