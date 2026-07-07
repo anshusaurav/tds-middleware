@@ -1,10 +1,12 @@
 import base64
+import os
 import re
 import time
 import uuid
 from collections import defaultdict, deque
 from typing import Deque, Dict, Optional, Tuple
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -18,6 +20,10 @@ ALLOWED_ORIGINS = {
     "https://exam.sanand.workers.dev",
 }
 
+# Paths that must accept any origin (grader sends from a Cloudflare Worker
+# whose subdomain isn't fixed). CORS reflects whatever Origin arrives.
+PERMISSIVE_CORS_PATHS = ("/answer-image",)
+
 # (limit, window_seconds) keyed by path prefix; longest prefix wins.
 PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/ping": (14, 10.0),
@@ -28,6 +34,7 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/healthz": (10_000, 10.0),
     "/logs": (10_000, 10.0),
     "/analytics": (10_000, 10.0),
+    "/answer-image": (10_000, 10.0),
 }
 DEFAULT_LIMIT: Tuple[int, float] = (20, 10.0)
 
@@ -106,7 +113,9 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 class ScopedCORSMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         origin = request.headers.get("Origin")
-        allowed = origin in ALLOWED_ORIGINS
+        path = request.url.path
+        is_permissive = any(path == p or path.startswith(p + "/") for p in PERMISSIVE_CORS_PATHS)
+        allowed = origin in ALLOWED_ORIGINS or (is_permissive and origin is not None)
 
         if request.method == "OPTIONS":
             if allowed:
@@ -114,7 +123,7 @@ class ScopedCORSMiddleware(BaseHTTPMiddleware):
                     "Access-Control-Allow-Origin": origin,
                     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                     "Access-Control-Allow-Headers":
-                        "X-Request-ID, X-Client-Id, Idempotency-Key, X-API-Key, Content-Type",
+                        "X-Request-ID, X-Client-Id, Idempotency-Key, X-API-Key, Content-Type, Authorization",
                     "Access-Control-Expose-Headers": "X-Request-ID, Retry-After",
                     "Access-Control-Max-Age": "600",
                     "Vary": "Origin",
@@ -426,3 +435,91 @@ async def analytics(request: Request):
         "revenue": revenue,
         "top_user": top_user,
     }
+
+
+# ---------- Multimodal image QA ----------
+AIPIPE_BASE = "https://aipipe.org/openai/v1"
+AIPIPE_MODEL = "gpt-4o-mini"
+AIPIPE_SYSTEM_PROMPT = (
+    "You extract a single answer from an image. Look at the image and answer the "
+    "user's question. Return ONLY the raw answer value with no units, no currency "
+    "symbols, no labels, no explanation, no punctuation beyond a decimal point. "
+    "For numeric answers return just the number as a string (e.g. '4089.35'). "
+    "For text answers return only the exact value."
+)
+
+
+class AnswerImageRequest(BaseModel):
+    image_base64: str
+    question: str
+
+
+class AnswerImageResponse(BaseModel):
+    answer: str
+
+
+def _sanitise_answer(raw: str) -> str:
+    s = (raw or "").strip()
+    # Drop wrapping quotes / backticks the model sometimes emits
+    s = s.strip("`\"' \n\t")
+    # If the model still adds a trailing period or comma, drop it
+    if s.endswith((".", ",")) and not re.search(r"\d\.\d*$", s):
+        s = s.rstrip(".,")
+    return s
+
+
+@app.post("/answer-image", response_model=AnswerImageResponse)
+async def answer_image(req: AnswerImageRequest):
+    token = os.environ.get("AIPIPE_TOKEN", "").strip()
+    if not token:
+        raise HTTPException(status_code=500, detail="AIPIPE_TOKEN not configured on server")
+
+    b64 = req.image_base64 or ""
+    # Strip a data URL prefix if the caller supplied one
+    if b64.startswith("data:"):
+        b64 = b64.split(",", 1)[-1]
+    if not b64:
+        raise HTTPException(status_code=422, detail="image_base64 is required")
+
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=422, detail="question is required")
+
+    data_url = f"data:image/png;base64,{b64}"
+    payload = {
+        "model": AIPIPE_MODEL,
+        "messages": [
+            {"role": "system", "content": AIPIPE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+        "temperature": 0,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{AIPIPE_BASE}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"upstream call failed: {e}")
+
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"upstream {r.status_code}: {r.text[:400]}")
+
+    try:
+        content = r.json()["choices"][0]["message"]["content"]
+    except Exception:
+        raise HTTPException(status_code=502, detail=f"unexpected upstream shape: {r.text[:400]}")
+
+    return AnswerImageResponse(answer=_sanitise_answer(str(content)))
