@@ -982,7 +982,7 @@ def _empty_audio_response():
         "mode": {},
         "range": {},
         "allowed_values": {},
-        "value_range": [],
+        "value_range": {},
         "correlation": [],
     }
 
@@ -1038,7 +1038,7 @@ async def _gemini_audio_to_table(audio_bytes: bytes) -> dict:
         "  mode: {column_name: mode_value}\n"
         "  range: {column_name: range_value}\n"
         "  allowed_values: {column_name: [allowed values]} for categorical columns\n"
-        "  value_range: list of [min, max] pairs in the order of numeric columns\n"
+        "  value_range: {column_name: [min, max]} - only for columns the audio explicitly gives BOTH min and max for\n"
         "  correlation: list of [column_a, column_b, correlation_value] triples\n"
         "  transcription: the verbatim Korean transcription\n\n"
         "Numeric values must be JSON numbers, not strings. Do NOT invent values "
