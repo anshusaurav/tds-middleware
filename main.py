@@ -1006,35 +1006,56 @@ def _sniff_audio_format(audio_bytes: bytes) -> str:
 
 
 async def _transcribe_via_aipipe(audio_bytes: bytes, token: str) -> str:
-    """Transcribe using gpt-4o-audio-preview (JSON body, avoids multipart)."""
+    """Try several AI-Pipe-compatible transcription paths; raise if all fail."""
     fmt = _sniff_audio_format(audio_bytes)
     b64 = base64.b64encode(audio_bytes).decode()
-    payload = {
-        "model": "gpt-4o-audio-preview",
-        "modalities": ["text"],
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text",
-                     "text": "Transcribe the following audio verbatim. Output only the transcription text with no explanation."},
-                    {"type": "input_audio",
-                     "input_audio": {"data": b64, "format": fmt}},
-                ],
-            }
-        ],
-        "temperature": 0,
-    }
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        r = await client.post(
-            f"{AIPIPE_BASE}/chat/completions",
-            headers={"Authorization": f"Bearer {token}",
-                     "Content-Type": "application/json"},
-            json=payload,
-        )
-    if r.status_code >= 400:
-        raise RuntimeError(f"audio-chat {r.status_code}: {r.text[:400]}")
-    return r.json()["choices"][0]["message"].get("content") or ""
+    errors = []
+
+    # Attempt 1: JSON body to /audio/transcriptions (AI Pipe's error told us to do this)
+    for model_name in ("whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"):
+        payload = {
+            "model": model_name,
+            "file": b64,
+            "language": "ko",
+            "response_format": "json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                r = await client.post(
+                    f"{AIPIPE_BASE}/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {token}",
+                             "Content-Type": "application/json"},
+                    json=payload,
+                )
+            if r.status_code < 400:
+                try:
+                    return r.json().get("text", "") or r.text
+                except Exception:
+                    return r.text or ""
+            errors.append(f"{model_name} json: {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            errors.append(f"{model_name} json: {e}")
+
+    # Attempt 2: multipart form to /audio/transcriptions
+    for model_name in ("whisper-1", "gpt-4o-mini-transcribe"):
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                r = await client.post(
+                    f"{AIPIPE_BASE}/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {token}"},
+                    files={"file": (f"audio.{fmt}", audio_bytes, f"audio/{fmt}")},
+                    data={"model": model_name, "language": "ko"},
+                )
+            if r.status_code < 400:
+                try:
+                    return r.json().get("text", "") or r.text
+                except Exception:
+                    return r.text or ""
+            errors.append(f"{model_name} multipart: {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            errors.append(f"{model_name} multipart: {e}")
+
+    raise RuntimeError(" | ".join(errors)[:800])
 
 
 async def _parse_table_via_llm(transcription: str, token: str) -> dict:
