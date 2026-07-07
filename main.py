@@ -425,19 +425,39 @@ def _extract_iso_date(text: str) -> Optional[str]:
 
 
 _INV_LABEL_RE = re.compile(
-    r"(?:invoice\s*(?:no\.?|number|#|id)|inv\.?\s*(?:no\.?|#))\s*[:=#\-]?\s*([A-Z0-9][A-Z0-9\-_/]*)",
+    r"\b(?:invoice|inv\.?|bill|receipt|order|reference|ref\.?|"
+    r"document|doc\.?|voucher|po|purchase\s*order)\b"
+    r"\s*(?:no\.?|number|num|#|id)?\s*[:=#\-]?\s*"
+    r"([A-Z][A-Z0-9\-_/]*)",
     re.IGNORECASE,
 )
-_INV_PATTERN_RE = re.compile(r"\b(INV[-_/]\w+(?:[-_/]\w+)*)\b", re.IGNORECASE)
+# Standalone: uppercase-letter-prefixed alphanumeric with a separator.
+# Requires >=2 leading letters (so "USD-100" style currency codes don't win),
+# and rejects month codes (JAN, FEB, ...) and 3-letter currency codes as pure heads.
+_INV_STANDALONE_RE = re.compile(
+    r"\b([A-Za-z]{2,6}[-_/]\d[\w\-_/]*)\b"
+)
+_CURRENCY_PREFIXES = {
+    "USD","EUR","GBP","INR","JPY","AUD","CAD","CHF","CNY","SGD","HKD",
+    "NZD","SEK","NOK","DKK","ZAR","MXN","BRL","AED","SAR","RUB","KRW","TRY",
+}
+_MONTH_PREFIXES = {
+    "JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","SEPT","OCT","NOV","DEC",
+}
 
 
 def _extract_invoice_no(text: str) -> Optional[str]:
     m = _INV_LABEL_RE.search(text)
     if m:
-        return m.group(1).strip().rstrip(".,;:")
-    m = _INV_PATTERN_RE.search(text)
-    if m:
-        return m.group(1).strip().rstrip(".,;:")
+        v = m.group(1).strip().rstrip(".,;:")
+        if v:
+            return v
+    for m in _INV_STANDALONE_RE.finditer(text):
+        v = m.group(1).strip().rstrip(".,;:")
+        head = re.split(r"[-_/]", v, 1)[0].upper()
+        if head in _CURRENCY_PREFIXES or head in _MONTH_PREFIXES:
+            continue
+        return v
     return None
 
 
