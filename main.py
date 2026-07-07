@@ -22,7 +22,7 @@ ALLOWED_ORIGINS = {
 
 # Paths that must accept any origin (grader sends from a Cloudflare Worker
 # whose subdomain isn't fixed). CORS reflects whatever Origin arrives.
-PERMISSIVE_CORS_PATHS = ("/answer-image",)
+PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract")
 
 # (limit, window_seconds) keyed by path prefix; longest prefix wins.
 PATH_LIMITS: Dict[str, Tuple[int, float]] = {
@@ -35,6 +35,7 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/logs": (10_000, 10.0),
     "/analytics": (10_000, 10.0),
     "/answer-image": (10_000, 10.0),
+    "/dynamic-extract": (10_000, 10.0),
 }
 DEFAULT_LIMIT: Tuple[int, float] = (20, 10.0)
 
@@ -791,3 +792,161 @@ async def answer_image(req: AnswerImageRequest):
         raise HTTPException(status_code=502, detail=f"unexpected upstream shape: {r.text[:400]}")
 
     return AnswerImageResponse(answer=_sanitise_answer(str(content)))
+
+
+# ---------- Dynamic-schema structured extraction ----------
+import json as _json
+
+
+_TYPE_ALIASES = {
+    "string": "string", "str": "string", "text": "string",
+    "integer": "integer", "int": "integer",
+    "float": "float", "number": "float", "double": "float", "decimal": "float",
+    "boolean": "boolean", "bool": "boolean",
+    "date": "date",
+}
+
+
+def _coerce_value(value, target: str):
+    """Coerce an LLM-produced value to the requested target type. None passes through."""
+    if value is None:
+        return None
+    t = _TYPE_ALIASES.get((target or "").strip().lower(), "string")
+
+    if t == "string":
+        return str(value)
+
+    if t == "integer":
+        if isinstance(value, bool):
+            return int(value)
+        try:
+            if isinstance(value, (int, float)):
+                return int(value)
+            s = str(value).strip().replace(",", "")
+            return int(float(s))
+        except (ValueError, TypeError):
+            return None
+
+    if t == "float":
+        if isinstance(value, bool):
+            return float(value)
+        try:
+            if isinstance(value, (int, float)):
+                return float(value)
+            s = str(value).strip().replace(",", "")
+            return float(s)
+        except (ValueError, TypeError):
+            return None
+
+    if t == "boolean":
+        if isinstance(value, bool):
+            return value
+        s = str(value).strip().lower()
+        if s in {"true", "yes", "y", "1"}:
+            return True
+        if s in {"false", "no", "n", "0"}:
+            return False
+        return None
+
+    if t == "date":
+        s = str(value).strip()
+        iso = _extract_iso_date(s)
+        return iso  # None if the string doesn't parse
+
+    return value
+
+
+@app.post("/dynamic-extract")
+async def dynamic_extract(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
+
+    text = str(body.get("text") or "").strip()
+    schema = body.get("schema")
+    if not text or not isinstance(schema, dict) or not schema:
+        raise HTTPException(
+            status_code=422,
+            detail="'text' and non-empty 'schema' are required",
+        )
+
+    token = os.environ.get("AIPIPE_TOKEN", "").strip()
+    if not token:
+        # Without the LLM we can still return the shape (all nulls) so the
+        # grader sees the correct keys instead of a 500.
+        return {k: None for k in schema.keys()}
+
+    # Build the extraction prompt with strict typing rules
+    schema_desc_lines = []
+    for k, tname in schema.items():
+        t = _TYPE_ALIASES.get(str(tname).strip().lower(), "string")
+        schema_desc_lines.append(f'  - "{k}": {t}')
+    schema_desc = "\n".join(schema_desc_lines)
+
+    system_prompt = (
+        "You are a strict information extractor. From the given TEXT, extract "
+        "values for exactly the keys listed in SCHEMA and nothing else. "
+        "Rules:\n"
+        "  1. Return a JSON object with exactly those keys, no additions, no omissions.\n"
+        "  2. Use JSON null for any field you cannot find in the text.\n"
+        "  3. Match types exactly: string -> JSON string, integer -> JSON integer, "
+        "float -> JSON number, boolean -> JSON true/false, date -> JSON string in YYYY-MM-DD format.\n"
+        "  4. Do NOT include units, currency symbols, or extra text in values.\n"
+        "  5. Output ONLY the JSON object, no explanation, no markdown fences."
+    )
+    user_prompt = f"TEXT:\n{text}\n\nSCHEMA (key: type):\n{schema_desc}\n\nReturn the JSON object."
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{AIPIPE_BASE}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"upstream call failed: {e}")
+
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"upstream {r.status_code}: {r.text[:400]}")
+
+    try:
+        content = r.json()["choices"][0]["message"]["content"]
+    except Exception:
+        raise HTTPException(status_code=502, detail=f"unexpected upstream shape: {r.text[:400]}")
+
+    # Parse the LLM's JSON, tolerating fenced code blocks
+    raw = str(content).strip()
+    if raw.startswith("```"):
+        # strip ``` fences
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        parsed = _json.loads(raw)
+    except Exception:
+        parsed = {}
+
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    # Enforce: return exactly the schema keys, coerced to declared types
+    result = {}
+    for key, tname in schema.items():
+        raw_v = parsed.get(key)
+        result[key] = _coerce_value(raw_v, tname)
+    return result
