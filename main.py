@@ -1008,31 +1008,74 @@ def _sniff_audio_format(audio_bytes: bytes) -> str:
 async def _transcribe_via_aipipe(audio_bytes: bytes, token: str) -> str:
     """Try several AI-Pipe-compatible transcription paths; raise if all fail."""
     fmt = _sniff_audio_format(audio_bytes)
+    mime = {"mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg",
+            "flac": "audio/flac", "m4a": "audio/mp4"}.get(fmt, "audio/mpeg")
+    b64 = base64.b64encode(audio_bytes).decode()
+    data_url = f"data:{mime};base64,{b64}"
     errors = []
 
-    # AI Pipe's audio/transcriptions expects multipart AND a model it can price.
-    # Modern gpt-4o transcribe models have pricing configured; whisper-1 does not.
-    for model_name in (
-        "gpt-4o-mini-transcribe",
-        "gpt-4o-transcribe",
-        "whisper-1",
-    ):
+    async def try_call(label, url, kwargs):
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                r = await client.post(
-                    f"{AIPIPE_BASE}/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {token}"},
-                    files={"file": (f"audio.{fmt}", audio_bytes, f"audio/{fmt}")},
-                    data={"model": model_name, "language": "ko"},
-                )
+                r = await client.post(url, headers={"Authorization": f"Bearer {token}"}, **kwargs)
             if r.status_code < 400:
                 try:
-                    return r.json().get("text", "") or r.text
+                    j = r.json()
+                    return j.get("text") or (j.get("choices", [{}])[0].get("message", {}).get("content") or "") or r.text
                 except Exception:
                     return r.text or ""
-            errors.append(f"{model_name} multipart: {r.status_code} {r.text[:400]}")
+            errors.append(f"{label}: {r.status_code} {r.text[:300]}")
         except Exception as e:
-            errors.append(f"{model_name} multipart: {e}")
+            errors.append(f"{label}: {e}")
+        return None
+
+    endpoint = f"{AIPIPE_BASE}/audio/transcriptions"
+
+    # 1) Multipart with model in URL query (pricing check may read the query)
+    for m in ("gpt-4o-mini-transcribe", "whisper-1"):
+        r = await try_call(
+            f"{m} multipart+query",
+            f"{endpoint}?model={m}",
+            {"files": {"file": (f"audio.{fmt}", audio_bytes, mime)},
+             "data": {"model": m, "language": "ko"}},
+        )
+        if r is not None:
+            return r
+
+    # 2) JSON body with file as a data URL string
+    for m in ("gpt-4o-mini-transcribe", "whisper-1"):
+        r = await try_call(
+            f"{m} json+data-url",
+            endpoint,
+            {"json": {"model": m, "file": data_url, "language": "ko",
+                      "response_format": "json"}},
+        )
+        if r is not None:
+            return r
+
+    # 3) JSON body with file as {content, content_type} object
+    for m in ("gpt-4o-mini-transcribe", "whisper-1"):
+        r = await try_call(
+            f"{m} json+obj",
+            endpoint,
+            {"json": {"model": m,
+                      "file": {"content": b64, "content_type": mime,
+                                "filename": f"audio.{fmt}"},
+                      "language": "ko"}},
+        )
+        if r is not None:
+            return r
+
+    # 4) OpenRouter base + audio transcriptions (long-shot)
+    or_endpoint = "https://aipipe.org/openrouter/v1/audio/transcriptions"
+    r = await try_call(
+        "openrouter whisper-1 multipart",
+        or_endpoint,
+        {"files": {"file": (f"audio.{fmt}", audio_bytes, mime)},
+         "data": {"model": "openai/whisper-1", "language": "ko"}},
+    )
+    if r is not None:
+        return r
 
     raise RuntimeError(" || ".join(errors)[:3000])
 
