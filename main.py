@@ -987,17 +987,54 @@ def _empty_audio_response():
     }
 
 
+def _sniff_audio_format(audio_bytes: bytes) -> str:
+    """Detect audio format from magic bytes; default to wav."""
+    if len(audio_bytes) < 4:
+        return "wav"
+    head = audio_bytes[:4]
+    if head[:3] == b"ID3" or (head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+        return "mp3"
+    if head == b"RIFF":
+        return "wav"
+    if head == b"OggS":
+        return "ogg"
+    if head[:4] == b"fLaC":
+        return "flac"
+    if head[:4] in (b"\x00\x00\x00\x18", b"\x00\x00\x00\x20"):
+        return "m4a"
+    return "mp3"  # safest default given AI Pipe's payload
+
+
 async def _transcribe_via_aipipe(audio_bytes: bytes, token: str) -> str:
+    """Transcribe using gpt-4o-audio-preview (JSON body, avoids multipart)."""
+    fmt = _sniff_audio_format(audio_bytes)
+    b64 = base64.b64encode(audio_bytes).decode()
+    payload = {
+        "model": "gpt-4o-audio-preview",
+        "modalities": ["text"],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text",
+                     "text": "Transcribe the following audio verbatim. Output only the transcription text with no explanation."},
+                    {"type": "input_audio",
+                     "input_audio": {"data": b64, "format": fmt}},
+                ],
+            }
+        ],
+        "temperature": 0,
+    }
     async with httpx.AsyncClient(timeout=120.0) as client:
         r = await client.post(
-            f"{AIPIPE_BASE}/audio/transcriptions",
-            headers={"Authorization": f"Bearer {token}"},
-            files={"file": ("audio.wav", audio_bytes, "audio/wav")},
-            data={"model": "whisper-1", "language": "ko"},
+            f"{AIPIPE_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"},
+            json=payload,
         )
     if r.status_code >= 400:
-        raise RuntimeError(f"whisper {r.status_code}: {r.text[:400]}")
-    return r.json().get("text", "")
+        raise RuntimeError(f"audio-chat {r.status_code}: {r.text[:400]}")
+    return r.json()["choices"][0]["message"].get("content") or ""
 
 
 async def _parse_table_via_llm(transcription: str, token: str) -> dict:
