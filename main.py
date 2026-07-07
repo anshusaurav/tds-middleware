@@ -1280,6 +1280,16 @@ async def _handle_audio_analyze(request: Request):
                         derived.append(key)
         result["columns"] = derived
 
+    # Anti-hallucination: value_range should only exist when the audio
+    # explicitly gives a value-range constraint (Korean: "값의 범위",
+    # "허용 범위", "값 범위"). Gemini tends to over-produce it, so clear
+    # it unless the transcription contains such a keyword.
+    transcription = str(parsed.get("transcription", ""))
+    range_markers = ("값의 범위", "값 범위", "허용 범위", "허용범위",
+                     "range", "value range")
+    if not any(m in transcription for m in range_markers):
+        result["value_range"] = {}
+
     dbg["stats"] = result
     return result
 
