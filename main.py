@@ -1109,6 +1109,9 @@ def _compute_stats(table: dict) -> dict:
     }
 
 
+_AUDIO_DEBUG: Dict[str, dict] = {}
+
+
 async def _handle_audio_analyze(request: Request):
     try:
         body = await request.json()
@@ -1117,26 +1120,52 @@ async def _handle_audio_analyze(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="body must be a JSON object")
 
+    audio_id = str(body.get("audio_id") or "unknown")
     audio_b64 = body.get("audio_base64", "")
+    dbg = {"audio_id": audio_id}
+    _AUDIO_DEBUG[audio_id] = dbg
+
     if not audio_b64:
+        dbg["error"] = "empty audio_base64"
         return _empty_audio_response()
 
     token = os.environ.get("AIPIPE_TOKEN", "").strip()
     if not token:
+        dbg["error"] = "no AIPIPE_TOKEN on server"
         return _empty_audio_response()
 
     try:
         audio_bytes = base64.b64decode(audio_b64)
-    except Exception:
+        dbg["audio_bytes"] = len(audio_bytes)
+        dbg["audio_magic"] = audio_bytes[:8].hex() if audio_bytes else ""
+    except Exception as e:
+        dbg["error"] = f"base64 decode: {e}"
         return _empty_audio_response()
 
     try:
         transcription = await _transcribe_via_aipipe(audio_bytes, token)
-        if not transcription.strip():
-            return _empty_audio_response()
+        dbg["transcription"] = (transcription or "")[:1000]
+    except Exception as e:
+        dbg["error"] = f"whisper: {str(e)[:400]}"
+        return _empty_audio_response()
+
+    if not transcription.strip():
+        dbg["error"] = "whisper returned empty text"
+        return _empty_audio_response()
+
+    try:
         table = await _parse_table_via_llm(transcription, token)
-        return _compute_stats(table)
-    except Exception:
+        dbg["table"] = table
+    except Exception as e:
+        dbg["error"] = f"llm parse: {str(e)[:400]}"
+        return _empty_audio_response()
+
+    try:
+        stats = _compute_stats(table)
+        dbg["stats"] = stats
+        return stats
+    except Exception as e:
+        dbg["error"] = f"stats: {str(e)[:400]}"
         return _empty_audio_response()
 
 
@@ -1148,3 +1177,14 @@ async def audio_analyze(request: Request):
 @app.post("/audio-stats")
 async def audio_stats(request: Request):
     return await _handle_audio_analyze(request)
+
+
+@app.get("/audio-debug")
+async def audio_debug_all():
+    return {"count": len(_AUDIO_DEBUG),
+            "recent": dict(list(_AUDIO_DEBUG.items())[-10:])}
+
+
+@app.get("/audio-debug/{audio_id}")
+async def audio_debug_one(audio_id: str):
+    return _AUDIO_DEBUG.get(audio_id, {"note": "no debug for this audio_id"})
