@@ -983,7 +983,7 @@ def _empty_audio_response():
         "range": {},
         "allowed_values": {},
         "value_range": {},
-        "correlation": {},
+        "correlation": [],
     }
 
 
