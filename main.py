@@ -1022,16 +1022,27 @@ async def _gemini_audio_to_table(audio_bytes: bytes) -> dict:
     b64 = base64.b64encode(audio_bytes).decode()
 
     prompt = (
-        "The audio is in Korean and describes a small tabular dataset. "
-        "Do BOTH tasks:\n"
-        "1) Transcribe the audio verbatim.\n"
-        "2) Extract the table it describes.\n\n"
-        "Return exactly ONE JSON object with three keys:\n"
-        "  transcription: string, verbatim Korean text\n"
-        "  columns: ordered list of column names in the original Korean\n"
-        "  data: list of row objects mapping column name to value; "
-        "numeric values as JSON numbers, categorical as JSON strings\n\n"
-        "Output ONLY the JSON, no explanation, no markdown fences."
+        "The audio is in Korean and describes STATISTICAL SPECIFICATIONS for "
+        "a dataset (row count, column names, per-column stats — NOT the "
+        "individual row values themselves).\n\n"
+        "Listen carefully and return exactly ONE JSON object with these keys "
+        "(use null / [] / {} if a value is not stated in the audio):\n"
+        "  rows: integer, the total row count stated in the audio\n"
+        "  columns: ordered list of column names (keep the original Korean)\n"
+        "  mean: {column_name: mean_value} for each numeric column\n"
+        "  std: [std_value, ...] in the order of numeric columns\n"
+        "  variance: {column_name: variance_value}\n"
+        "  min: {column_name: min_value}\n"
+        "  max: {column_name: max_value}\n"
+        "  median: [median_value, ...] in the order of numeric columns\n"
+        "  mode: {column_name: mode_value}\n"
+        "  range: {column_name: range_value}\n"
+        "  allowed_values: {column_name: [allowed values]} for categorical columns\n"
+        "  value_range: [[min, max], ...] in the order of numeric columns\n"
+        "  correlation: correlation matrix as list of lists between numeric columns\n"
+        "  transcription: the verbatim Korean transcription\n\n"
+        "Numeric values must be JSON numbers, not strings. Do NOT invent values "
+        "that aren't stated. Output ONLY the JSON, no explanation, no fences."
     )
 
     payload = {
@@ -1225,21 +1236,22 @@ async def _handle_audio_analyze(request: Request):
         return _empty_audio_response()
 
     try:
-        table = await _gemini_audio_to_table(audio_bytes)
-        dbg["transcription"] = str(table.get("transcription", ""))[:1000]
-        dbg["table"] = {"columns": table.get("columns"),
-                        "data": table.get("data")}
+        parsed = await _gemini_audio_to_table(audio_bytes)
+        dbg["transcription"] = str(parsed.get("transcription", ""))[:1000]
     except Exception as e:
         dbg["error"] = f"gemini: {str(e)}"[:3000]
         return _empty_audio_response()
 
-    try:
-        stats = _compute_stats(table)
-        dbg["stats"] = stats
-        return stats
-    except Exception as e:
-        dbg["error"] = f"stats: {str(e)[:400]}"
-        return _empty_audio_response()
+    # Gemini directly extracts the statistical specs from the audio.
+    # Merge onto the empty shape so all 13 keys are always present.
+    result = _empty_audio_response()
+    for k in result.keys():
+        v = parsed.get(k, None)
+        if v is None:
+            continue
+        result[k] = v
+    dbg["stats"] = result
+    return result
 
 
 @app.post("/audio-analyze")
