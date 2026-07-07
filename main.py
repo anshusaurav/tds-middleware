@@ -493,9 +493,12 @@ _TOTAL_RE_STRICT = re.compile(
     re.IGNORECASE,
 )
 _TAX_RE = re.compile(
-    r"\b(?:tax|gst|vat|cgst|sgst|igst|service\s*tax|sales\s*tax)"
-    r"(?:\s*\(\s*\d+(?:\.\d+)?\s*%?\s*\))?\s*[:=\-]?\s*"
-    r"(?:[\$€£₹]|Rs\.?|INR|USD|EUR|GBP)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+    r"\b(?:tax|gst|vat|cgst|sgst|igst|service\s*tax|sales\s*tax)\b"
+    r"[\s\(@:=\-]*"                                      # optional separators, incl. '(' or '@'
+    r"(?:\d+(?:\.\d+)?\s*%\s*\)?)?"                      # optional rate percentage (parens optional)
+    r"[\s\)@:=\-]*"                                       # more separators / closing paren
+    r"(?:[\$€£₹]|Rs\.?|INR|USD|EUR|GBP)?\s*"             # optional currency
+    r"([0-9][0-9,]*(?:\.[0-9]+)?)",                      # the amount
     re.IGNORECASE,
 )
 
