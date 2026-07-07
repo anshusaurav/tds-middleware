@@ -1005,77 +1005,65 @@ def _sniff_audio_format(audio_bytes: bytes) -> str:
     return "mp3"  # safest default given AI Pipe's payload
 
 
-async def _transcribe_via_aipipe(audio_bytes: bytes, token: str) -> str:
-    """Try several AI-Pipe-compatible transcription paths; raise if all fail."""
+OPENROUTER_BASE = "https://aipipe.org/openrouter/v1"
+
+
+async def _gemini_audio_to_table(audio_bytes: bytes, token: str) -> dict:
+    """Use Gemini 2.5 Flash via OpenRouter (audio-input capable) to transcribe the
+    Korean audio AND parse the described table in one call. Returns
+    {'columns': [...], 'data': [...], 'transcription': '...'}."""
     fmt = _sniff_audio_format(audio_bytes)
-    mime = {"mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg",
-            "flac": "audio/flac", "m4a": "audio/mp4"}.get(fmt, "audio/mpeg")
     b64 = base64.b64encode(audio_bytes).decode()
-    data_url = f"data:{mime};base64,{b64}"
-    errors = []
 
-    async def try_call(label, url, kwargs):
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                r = await client.post(url, headers={"Authorization": f"Bearer {token}"}, **kwargs)
-            if r.status_code < 400:
-                try:
-                    j = r.json()
-                    return j.get("text") or (j.get("choices", [{}])[0].get("message", {}).get("content") or "") or r.text
-                except Exception:
-                    return r.text or ""
-            errors.append(f"{label}: {r.status_code} {r.text[:300]}")
-        except Exception as e:
-            errors.append(f"{label}: {e}")
-        return None
-
-    endpoint = f"{AIPIPE_BASE}/audio/transcriptions"
-
-    # 1) Multipart with model in URL query (pricing check may read the query)
-    for m in ("gpt-4o-mini-transcribe", "whisper-1"):
-        r = await try_call(
-            f"{m} multipart+query",
-            f"{endpoint}?model={m}",
-            {"files": {"file": (f"audio.{fmt}", audio_bytes, mime)},
-             "data": {"model": m, "language": "ko"}},
-        )
-        if r is not None:
-            return r
-
-    # 2) JSON body with file as a data URL string
-    for m in ("gpt-4o-mini-transcribe", "whisper-1"):
-        r = await try_call(
-            f"{m} json+data-url",
-            endpoint,
-            {"json": {"model": m, "file": data_url, "language": "ko",
-                      "response_format": "json"}},
-        )
-        if r is not None:
-            return r
-
-    # 3) JSON body with file as {content, content_type} object
-    for m in ("gpt-4o-mini-transcribe", "whisper-1"):
-        r = await try_call(
-            f"{m} json+obj",
-            endpoint,
-            {"json": {"model": m,
-                      "file": {"content": b64, "content_type": mime,
-                                "filename": f"audio.{fmt}"},
-                      "language": "ko"}},
-        )
-        if r is not None:
-            return r
-
-    # 4) OpenRouter base + audio transcriptions (long-shot)
-    or_endpoint = "https://aipipe.org/openrouter/v1/audio/transcriptions"
-    r = await try_call(
-        "openrouter whisper-1 multipart",
-        or_endpoint,
-        {"files": {"file": (f"audio.{fmt}", audio_bytes, mime)},
-         "data": {"model": "openai/whisper-1", "language": "ko"}},
+    prompt = (
+        "The audio is in Korean and describes a small tabular dataset. Do BOTH: "
+        "(1) transcribe the audio verbatim, and "
+        "(2) extract the table it describes. "
+        "Return ONE JSON object with exactly these three keys: "
+        "'transcription' (string, verbatim Korean text), "
+        "'columns' (ordered list of column names in the original language), "
+        "'data' (list of row objects mapping column name to value; "
+        "numeric values as JSON numbers, categorical as JSON strings). "
+        "Output ONLY the JSON, no explanation, no markdown."
     )
-    if r is not None:
-        return r
+
+    payload = {
+        "model": "google/gemini-2.5-flash",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "input_audio", "input_audio": {"data": b64, "format": fmt}},
+            ]}
+        ],
+        "response_format": {"type": "json_object"},
+    }
+
+    errors = []
+    for model_name in ("google/gemini-2.5-flash", "google/gemini-2.5-pro"):
+        payload["model"] = model_name
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                r = await client.post(
+                    f"{OPENROUTER_BASE}/chat/completions",
+                    headers={"Authorization": f"Bearer {token}",
+                             "Content-Type": "application/json"},
+                    json=payload,
+                )
+            if r.status_code >= 400:
+                errors.append(f"{model_name}: {r.status_code} {r.text[:300]}")
+                continue
+            content = r.json()["choices"][0]["message"].get("content") or ""
+            raw = str(content).strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+            parsed = _json.loads(raw)
+            if not isinstance(parsed, dict):
+                errors.append(f"{model_name}: non-dict content")
+                continue
+            return parsed
+        except Exception as e:
+            errors.append(f"{model_name}: {e}")
 
     raise RuntimeError(" || ".join(errors)[:3000])
 
@@ -1223,21 +1211,12 @@ async def _handle_audio_analyze(request: Request):
         return _empty_audio_response()
 
     try:
-        transcription = await _transcribe_via_aipipe(audio_bytes, token)
-        dbg["transcription"] = (transcription or "")[:1000]
+        table = await _gemini_audio_to_table(audio_bytes, token)
+        dbg["transcription"] = str(table.get("transcription", ""))[:1000]
+        dbg["table"] = {"columns": table.get("columns"),
+                        "data": table.get("data")}
     except Exception as e:
-        dbg["error"] = f"whisper: {str(e)}"[:3000]
-        return _empty_audio_response()
-
-    if not transcription.strip():
-        dbg["error"] = "whisper returned empty text"
-        return _empty_audio_response()
-
-    try:
-        table = await _parse_table_via_llm(transcription, token)
-        dbg["table"] = table
-    except Exception as e:
-        dbg["error"] = f"llm parse: {str(e)[:400]}"
+        dbg["error"] = f"gemini: {str(e)}"[:3000]
         return _empty_audio_response()
 
     try:
