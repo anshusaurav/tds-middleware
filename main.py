@@ -1055,6 +1055,9 @@ async def _gemini_audio_to_table(audio_bytes: bytes) -> dict:
         "generationConfig": {
             "responseMimeType": "application/json",
             "temperature": 0,
+            # Gemini 2.5's default "thinking" mode adds several seconds
+            # of latency. The grader's 12s cap means we must disable it.
+            "thinkingConfig": {"thinkingBudget": 0},
         },
     }
 
