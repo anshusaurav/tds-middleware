@@ -629,6 +629,19 @@ async def extract(request: Request):
         raise HTTPException(status_code=422, detail="body must be a JSON object")
 
     # Dispatch by which key the caller sent
+    # New (assignment 7): {"document_id": ..., "text": ..., "schema": ...}
+    if "schema" in body and "text" in body:
+        text = str(body.get("text") or "").strip()
+        schema = body.get("schema")
+        if not text or not isinstance(schema, dict):
+            raise HTTPException(status_code=422, detail="text and schema required")
+        try:
+            return await _extract_invoice_structured(text, schema)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"extract failed: {e}")
+
     if "invoice_text" in body:
         text = str(body.get("invoice_text") or "").strip()
         if not text:
@@ -661,6 +674,122 @@ async def extract(request: Request):
         status_code=422,
         detail="body must contain either 'text' or 'invoice_text'",
     )
+
+
+# ---------- Assignment 7: schema-driven invoice extractor ----------
+INVOICE_SYSTEM_PROMPT = (
+    "You extract structured invoice data. Given raw invoice text and a JSON "
+    "schema, return a JSON object matching the schema EXACTLY: same keys, "
+    "correct types, in the same order the schema declares.\n\n"
+    "Field-specific rules:\n"
+    "  vendor: the biller's proper name, exactly as written (do not paraphrase).\n"
+    "  currency: ISO 4217 code. '$'=USD, '€'=EUR, '£'=GBP, '¥'=JPY, "
+    "'₹' or 'Rs'=INR, 'yen'/'euros'/'pounds sterling' etc. map to their codes.\n"
+    "  total_amount: integer, no separators, no symbols. Handle:\n"
+    "    - number words ('twelve thousand four hundred eighty' -> 12480)\n"
+    "    - Indian grouping ('1,24,800' -> 124800)\n"
+    "    - 'K' / 'M' suffixes ('12K' -> 12000, '2.5M' -> 2500000).\n"
+    "  invoice_date: normalize to YYYY-MM-DD.\n"
+    "  due_in_days: integer inferred from wording. 'Net 30' -> 30, "
+    "'due in two weeks' -> 14, 'payable within 45 days' -> 45.\n"
+    "  is_paid: boolean. 'paid in full' / 'paid' -> true, "
+    "'awaiting payment' / 'unpaid' / 'due' -> false.\n"
+    "  priority: exactly one of 'low', 'normal', 'high', 'urgent'.\n"
+    "  contact_email: MUST be lowercased.\n"
+    "  line_items: array of {sku, quantity (int), unit_price (int)} in the "
+    "order they appear in the text.\n"
+    "  item_count: number of line_items (an integer).\n\n"
+    "Return ONLY the JSON object. No prose, no markdown fences."
+)
+
+
+async def _extract_invoice_structured(text: str, schema: dict) -> dict:
+    token = os.environ.get("AIPIPE_TOKEN", "").strip()
+    if not token:
+        raise HTTPException(status_code=500, detail="AIPIPE_TOKEN not configured")
+
+    user_prompt = (
+        f"INVOICE TEXT:\n{text}\n\n"
+        f"SCHEMA:\n{_json.dumps(schema)}\n\n"
+        "Return the JSON object."
+    )
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": INVOICE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(
+            f"{AIPIPE_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"},
+            json=payload,
+        )
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502,
+                            detail=f"upstream {r.status_code}: {r.text[:400]}")
+    try:
+        content = r.json()["choices"][0]["message"]["content"]
+    except Exception:
+        raise HTTPException(status_code=502,
+                            detail=f"unexpected upstream shape: {r.text[:400]}")
+    raw = str(content).strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        parsed = _json.loads(raw)
+    except Exception:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    # Enforce schema key order and presence
+    return _conform_to_schema(parsed, schema)
+
+
+def _conform_to_schema(obj, schema):
+    """Return an object with EXACTLY the keys the schema declares, in schema
+    order. Missing keys become None; extra keys are dropped."""
+    if not isinstance(schema, dict):
+        return obj
+    if schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
+        result = {}
+        for key, subschema in schema["properties"].items():
+            v = obj.get(key) if isinstance(obj, dict) else None
+            if isinstance(subschema, dict):
+                if subschema.get("type") == "array" and "items" in subschema:
+                    item_schema = subschema["items"]
+                    if isinstance(v, list):
+                        v = [_conform_to_schema(x, item_schema) for x in v]
+                    else:
+                        v = []
+                elif subschema.get("type") == "object":
+                    v = _conform_to_schema(v if isinstance(v, dict) else {}, subschema)
+                elif subschema.get("type") == "string" and v is not None:
+                    v = str(v)
+                elif subschema.get("type") == "integer" and v is not None:
+                    try:
+                        v = int(v) if not isinstance(v, bool) else int(v)
+                    except (ValueError, TypeError):
+                        v = None
+                elif subschema.get("type") == "number" and v is not None:
+                    try:
+                        v = float(v)
+                    except (ValueError, TypeError):
+                        v = None
+                elif subschema.get("type") == "boolean" and v is not None:
+                    if isinstance(v, str):
+                        v = v.strip().lower() in ("true", "yes", "1")
+                    else:
+                        v = bool(v)
+            result[key] = v
+        return result
+    return obj
 
 
 # ---------- Analytics ----------
