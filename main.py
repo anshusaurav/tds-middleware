@@ -748,6 +748,15 @@ async def _extract_invoice_structured(text: str, schema: dict) -> dict:
     if not isinstance(parsed, dict):
         parsed = {}
 
+    # Override contact_email with a regex-extracted value from the raw text.
+    # gpt-4o-mini has been observed to mis-tokenize the last few characters
+    # of unusual emails (e.g. "ap@meridianpaperc.co" -> "ap@meridianpaperco.").
+    email_m = re.search(
+        r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text
+    )
+    if email_m and "contact_email" in (schema.get("properties") or {}):
+        parsed["contact_email"] = email_m.group(0).lower()
+
     # Enforce schema key order and presence
     return _conform_to_schema(parsed, schema)
 
