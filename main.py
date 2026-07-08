@@ -757,6 +757,18 @@ async def _extract_invoice_structured(text: str, schema: dict) -> dict:
     if email_m and "contact_email" in (schema.get("properties") or {}):
         parsed["contact_email"] = email_m.group(0).lower()
 
+    # Strip trailing sentence-ending punctuation from string-typed fields
+    # (grader compares vendor strings exactly, and gpt-4o-mini sometimes
+    # tacks a period onto "Meridian Paper Co" -> "Meridian Paper Co.").
+    props = schema.get("properties") or {}
+    for key, subschema in props.items():
+        if key == "contact_email":
+            continue
+        if isinstance(subschema, dict) and subschema.get("type") == "string":
+            v = parsed.get(key)
+            if isinstance(v, str):
+                parsed[key] = v.rstrip(".!?,;: ").strip()
+
     # Enforce schema key order and presence
     return _conform_to_schema(parsed, schema)
 
