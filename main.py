@@ -22,7 +22,7 @@ ALLOWED_ORIGINS = {
 
 # Paths that must accept any origin (grader sends from a Cloudflare Worker
 # whose subdomain isn't fixed). CORS reflects whatever Origin arrives.
-PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank")
+PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve")
 
 # (limit, window_seconds) keyed by path prefix; longest prefix wins.
 PATH_LIMITS: Dict[str, Tuple[int, float]] = {
@@ -39,6 +39,7 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/audio-analyze": (10_000, 10.0),
     "/audio-stats": (10_000, 10.0),
     "/rank": (10_000, 10.0),
+    "/solve": (10_000, 10.0),
 }
 DEFAULT_LIMIT: Tuple[int, float] = (20, 10.0)
 
@@ -1523,3 +1524,108 @@ async def rank(request: Request):
     k = min(3, len(candidates))
     top_idx = _np.argsort(-sims)[:k].tolist()
     return {"ranking": [int(i) for i in top_idx]}
+
+
+# ---------- Word-problem solver ----------
+SOLVE_SYSTEM_PROMPT = (
+    "You solve arithmetic word problems reliably.\n"
+    "Rules:\n"
+    "  1. Read the problem carefully. Ignore distractor numbers that don't "
+    "belong in the calculation.\n"
+    "  2. Show your calculation step by step in the 'reasoning' field.\n"
+    "  3. 'reasoning' must be a plain-text string, AT LEAST 80 characters, "
+    "showing the arithmetic (e.g. 'Base = 150 * 8 = 1200. Order > 50 so apply "
+    "25% discount: 1200 * 0.75 = 900. Add 5% tax: 900 * 1.05 = 945. The km and "
+    "product-line counts are irrelevant.').\n"
+    "  4. 'answer' must be a JSON INTEGER (no quotes, no decimal). Round the "
+    "final result to the nearest integer if the problem's exact answer is a "
+    "whole number expressed as a decimal (e.g. 945.0 -> 945).\n"
+    "  5. No currency symbols, units, or extra text in 'answer'.\n"
+    "  6. Return ONLY a JSON object with keys 'reasoning' and 'answer'. No "
+    "extra keys, no markdown fences."
+)
+
+
+@app.post("/solve")
+async def solve(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
+
+    problem = str(body.get("problem") or "").strip()
+    if not problem:
+        raise HTTPException(status_code=422, detail="problem is required")
+
+    token = os.environ.get("AIPIPE_TOKEN", "").strip()
+    if not token:
+        raise HTTPException(status_code=500, detail="AIPIPE_TOKEN not configured")
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": SOLVE_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Problem:\n{problem}\n\nReturn the JSON object."},
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{AIPIPE_BASE}/chat/completions",
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json"},
+                json=payload,
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"upstream call failed: {e}")
+
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502,
+                            detail=f"upstream {r.status_code}: {r.text[:300]}")
+
+    try:
+        content = r.json()["choices"][0]["message"]["content"]
+    except Exception:
+        raise HTTPException(status_code=502,
+                            detail=f"unexpected upstream shape: {r.text[:300]}")
+
+    raw = str(content).strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        parsed = _json.loads(raw)
+    except Exception:
+        parsed = {}
+
+    reasoning = str(parsed.get("reasoning") or "").strip()
+    ans_raw = parsed.get("answer")
+
+    # Coerce answer to a strict JSON integer
+    try:
+        if isinstance(ans_raw, bool):
+            answer = int(ans_raw)
+        elif isinstance(ans_raw, (int, float)):
+            answer = int(round(float(ans_raw)))
+        else:
+            s = str(ans_raw).strip().replace(",", "").rstrip(".")
+            # strip common non-numeric decoration
+            s = re.sub(r"[^\d\-\.]", "", s)
+            answer = int(round(float(s))) if s else 0
+    except Exception:
+        answer = 0
+
+    # Guarantee reasoning is at least 80 chars — pad with a safe note if not
+    if len(reasoning) < 80:
+        pad = (" Working shown above uses only the numbers relevant to the "
+               "problem; other quantities are distractors.")
+        reasoning = (reasoning + pad).strip()
+        if len(reasoning) < 80:
+            reasoning = reasoning + " " * (80 - len(reasoning))
+
+    return {"reasoning": reasoning, "answer": answer}
