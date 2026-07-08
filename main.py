@@ -22,7 +22,7 @@ ALLOWED_ORIGINS = {
 
 # Paths that must accept any origin (grader sends from a Cloudflare Worker
 # whose subdomain isn't fixed). CORS reflects whatever Origin arrives.
-PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats")
+PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank")
 
 # (limit, window_seconds) keyed by path prefix; longest prefix wins.
 PATH_LIMITS: Dict[str, Tuple[int, float]] = {
@@ -38,6 +38,7 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/dynamic-extract": (10_000, 10.0),
     "/audio-analyze": (10_000, 10.0),
     "/audio-stats": (10_000, 10.0),
+    "/rank": (10_000, 10.0),
 }
 DEFAULT_LIMIT: Tuple[int, float] = (20, 10.0)
 
@@ -1471,3 +1472,54 @@ async def audio_debug_all():
 @app.get("/audio-debug/{audio_id}")
 async def audio_debug_one(audio_id: str):
     return _AUDIO_DEBUG.get(audio_id, {"note": "no debug for this audio_id"})
+
+
+# ---------- Semantic search top-K ranking ----------
+@app.post("/rank")
+async def rank(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
+
+    query = str(body.get("query") or "").strip()
+    candidates = body.get("candidates") or []
+    if not query or not isinstance(candidates, list) or not candidates:
+        return {"ranking": [0, 1, 2][: min(3, len(candidates))]}
+
+    token = os.environ.get("AIPIPE_TOKEN", "").strip()
+    if not token:
+        return {"ranking": list(range(min(3, len(candidates))))}
+
+    # Embed query + all candidates in a single batch call
+    inputs = [query] + [str(c) for c in candidates]
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{AIPIPE_BASE}/embeddings",
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json"},
+                json={"model": "text-embedding-3-small", "input": inputs},
+            )
+    except Exception:
+        return {"ranking": list(range(min(3, len(candidates))))}
+    if r.status_code >= 400:
+        return {"ranking": list(range(min(3, len(candidates))))}
+
+    try:
+        data = r.json()["data"]
+    except Exception:
+        return {"ranking": list(range(min(3, len(candidates))))}
+
+    # text-embedding-3-small returns unit-normalised vectors, so cosine
+    # similarity is just the dot product.
+    import numpy as _np
+    q = _np.array(data[0]["embedding"], dtype=_np.float64)
+    C = _np.array([d["embedding"] for d in data[1:]], dtype=_np.float64)
+    sims = C @ q
+
+    k = min(3, len(candidates))
+    top_idx = _np.argsort(-sims)[:k].tolist()
+    return {"ranking": [int(i) for i in top_idx]}
