@@ -1528,21 +1528,29 @@ async def rank(request: Request):
 
 # ---------- Word-problem solver ----------
 SOLVE_SYSTEM_PROMPT = (
-    "You solve arithmetic word problems reliably.\n"
-    "Rules:\n"
-    "  1. Read the problem carefully. Ignore distractor numbers that don't "
-    "belong in the calculation.\n"
-    "  2. Show your calculation step by step in the 'reasoning' field.\n"
-    "  3. 'reasoning' must be a plain-text string, AT LEAST 80 characters, "
-    "showing the arithmetic (e.g. 'Base = 150 * 8 = 1200. Order > 50 so apply "
-    "25% discount: 1200 * 0.75 = 900. Add 5% tax: 900 * 1.05 = 945. The km and "
-    "product-line counts are irrelevant.').\n"
-    "  4. 'answer' must be a JSON INTEGER (no quotes, no decimal). Round the "
-    "final result to the nearest integer if the problem's exact answer is a "
-    "whole number expressed as a decimal (e.g. 945.0 -> 945).\n"
-    "  5. No currency symbols, units, or extra text in 'answer'.\n"
-    "  6. Return ONLY a JSON object with keys 'reasoning' and 'answer'. No "
-    "extra keys, no markdown fences."
+    "You solve arithmetic word problems reliably.\n\n"
+    "Process (do all of this before answering):\n"
+    "  A. Restate the problem in your head. Identify the ONE quantity being "
+    "asked for.\n"
+    "  B. List every number in the problem and label each as 'used' or "
+    "'distractor'. Distractors are numbers that are stated but not needed "
+    "(e.g. distances, unrelated inventory counts, ages, dates).\n"
+    "  C. Write the arithmetic step by step using ONLY the used numbers. "
+    "Show every operation.\n"
+    "  D. SELF-CHECK: substitute the numbers back into the arithmetic and "
+    "recompute. If the recomputation disagrees with your answer, redo the "
+    "problem.\n\n"
+    "Output rules:\n"
+    "  1. Return a JSON object with EXACTLY two keys: 'reasoning' (string) "
+    "and 'answer' (integer).\n"
+    "  2. 'reasoning' >= 80 characters, plain text, shows the arithmetic "
+    "(e.g. 'Base = 150 * 8 = 1200. Order > 50 so apply 25% discount: "
+    "1200 * 0.75 = 900. Add 5% tax: 900 * 1.05 = 945. The km and product-line "
+    "counts are irrelevant.').\n"
+    "  3. 'answer' is a JSON INTEGER only. No quotes, no decimal, no currency "
+    "symbol, no units. Round to the nearest integer if the exact answer is "
+    "a whole number expressed as a decimal (e.g. 945.0 -> 945).\n"
+    "  4. No extra keys. No markdown fences. Output ONLY the JSON object."
 )
 
 
@@ -1559,40 +1567,75 @@ async def solve(request: Request):
     if not problem:
         raise HTTPException(status_code=422, detail="problem is required")
 
-    token = os.environ.get("AIPIPE_TOKEN", "").strip()
-    if not token:
-        raise HTTPException(status_code=500, detail="AIPIPE_TOKEN not configured")
+    # Prefer Gemini 2.5 Flash (better arithmetic than gpt-4o-mini); fall back
+    # to AI Pipe / gpt-4o-mini if Gemini isn't configured or errors.
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    aipipe_token = os.environ.get("AIPIPE_TOKEN", "").strip()
 
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {"role": "system", "content": SOLVE_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Problem:\n{problem}\n\nReturn the JSON object."},
-        ],
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-    }
+    content = None
+    upstream_errors = []
 
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(
-                f"{AIPIPE_BASE}/chat/completions",
-                headers={"Authorization": f"Bearer {token}",
-                         "Content-Type": "application/json"},
-                json=payload,
-            )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"upstream call failed: {e}")
+    if gemini_key:
+        gemini_payload = {
+            "contents": [{
+                "parts": [{
+                    "text": SOLVE_SYSTEM_PROMPT + "\n\nProblem:\n" + problem
+                            + "\n\nReturn the JSON object."
+                }]
+            }],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": 0,
+                # Keep thinking ON here -- accuracy matters more than the
+                # 5-second latency saving on this endpoint.
+            },
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                r = await client.post(
+                    f"{GEMINI_BASE}/models/gemini-2.5-flash:generateContent?key={gemini_key}",
+                    headers={"Content-Type": "application/json"},
+                    json=gemini_payload,
+                )
+            if r.status_code < 400:
+                body = r.json()
+                parts = (body.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+                content = "".join(p.get("text", "") for p in parts)
+            else:
+                upstream_errors.append(f"gemini {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            upstream_errors.append(f"gemini: {e}")
 
-    if r.status_code >= 400:
+    if content is None and aipipe_token:
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": SOLVE_SYSTEM_PROMPT},
+                {"role": "user",
+                 "content": f"Problem:\n{problem}\n\nReturn the JSON object."},
+            ],
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                r = await client.post(
+                    f"{AIPIPE_BASE}/chat/completions",
+                    headers={"Authorization": f"Bearer {aipipe_token}",
+                             "Content-Type": "application/json"},
+                    json=payload,
+                )
+            if r.status_code < 400:
+                content = r.json()["choices"][0]["message"]["content"]
+            else:
+                upstream_errors.append(f"aipipe {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            upstream_errors.append(f"aipipe: {e}")
+
+    if content is None:
         raise HTTPException(status_code=502,
-                            detail=f"upstream {r.status_code}: {r.text[:300]}")
-
-    try:
-        content = r.json()["choices"][0]["message"]["content"]
-    except Exception:
-        raise HTTPException(status_code=502,
-                            detail=f"unexpected upstream shape: {r.text[:300]}")
+                            detail=" | ".join(upstream_errors)[:400]
+                                   or "no LLM configured")
 
     raw = str(content).strip()
     if raw.startswith("```"):
