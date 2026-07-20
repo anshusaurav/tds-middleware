@@ -22,7 +22,7 @@ ALLOWED_ORIGINS = {
 
 # Paths that must accept any origin (grader sends from a Cloudflare Worker
 # whose subdomain isn't fixed). CORS reflects whatever Origin arrives.
-PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve")
+PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer")
 
 # (limit, window_seconds) keyed by path prefix; longest prefix wins.
 PATH_LIMITS: Dict[str, Tuple[int, float]] = {
@@ -40,6 +40,7 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/audio-stats": (10_000, 10.0),
     "/rank": (10_000, 10.0),
     "/solve": (10_000, 10.0),
+    "/grounded-answer": (10_000, 10.0),
 }
 DEFAULT_LIMIT: Tuple[int, float] = (20, 10.0)
 
@@ -1672,3 +1673,149 @@ async def solve(request: Request):
             reasoning = reasoning + " " * (80 - len(reasoning))
 
     return {"reasoning": reasoning, "answer": answer}
+
+
+# ---------- Grounded QA with citations ----------
+GROUNDED_SYSTEM_PROMPT = (
+    "You are a grounded question-answering system for high-reliability medical "
+    "and legal use. Answer ONLY from the provided context chunks. Never use "
+    "outside knowledge.\n\n"
+    "Rules:\n"
+    "  1. Read the question and every chunk. If the chunks contain enough "
+    "information to answer, produce a concise answer grounded verbatim in "
+    "the chunks, and cite ONLY the chunk_ids you actually used.\n"
+    "  2. If the chunks do NOT contain enough information to answer, respond "
+    "with the exact fields:\n"
+    "       answer: \"I don't know\"\n"
+    "       citations: []\n"
+    "       answerable: false\n"
+    "       confidence: any number <= 0.3\n"
+    "  3. Every id in citations MUST be a real chunk_id from the input. "
+    "Never invent chunk_ids.\n"
+    "  4. confidence is your calibrated probability that the answer is "
+    "correct (0.0-1.0). For confident direct answers use 0.8-1.0. For "
+    "partial evidence use 0.5-0.8. For unanswerable use <= 0.3.\n"
+    "  5. Return ONLY a JSON object with exactly these four keys: "
+    "answer (string), citations (list of strings), confidence (number), "
+    "answerable (boolean). No prose, no markdown."
+)
+
+
+@app.post("/grounded-answer")
+async def grounded_answer(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return {"answer": "I don't know", "citations": [], "confidence": 0.0,
+                "answerable": False}
+    if not isinstance(body, dict):
+        return {"answer": "I don't know", "citations": [], "confidence": 0.0,
+                "answerable": False}
+
+    question = str(body.get("question") or "").strip()
+    chunks = body.get("chunks") or []
+    if not isinstance(chunks, list):
+        chunks = []
+
+    # Validate and collect legitimate chunk IDs
+    real_ids = set()
+    chunk_lines = []
+    for c in chunks:
+        if not isinstance(c, dict):
+            continue
+        cid = c.get("chunk_id")
+        text = c.get("text")
+        if not isinstance(cid, str) or not isinstance(text, str):
+            continue
+        real_ids.add(cid)
+        chunk_lines.append(f"[{cid}] {text}")
+
+    if not question or not chunk_lines:
+        return {"answer": "I don't know", "citations": [], "confidence": 0.1,
+                "answerable": False}
+
+    token = os.environ.get("AIPIPE_TOKEN", "").strip()
+    if not token:
+        return {"answer": "I don't know", "citations": [], "confidence": 0.1,
+                "answerable": False}
+
+    user_prompt = (
+        "CONTEXT CHUNKS:\n" + "\n".join(chunk_lines)
+        + f"\n\nQUESTION: {question}\n\nReturn the JSON object."
+    )
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": GROUNDED_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                f"{AIPIPE_BASE}/chat/completions",
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json"},
+                json=payload,
+            )
+    except Exception:
+        return {"answer": "I don't know", "citations": [], "confidence": 0.1,
+                "answerable": False}
+
+    if r.status_code >= 400:
+        return {"answer": "I don't know", "citations": [], "confidence": 0.1,
+                "answerable": False}
+
+    try:
+        content = r.json()["choices"][0]["message"]["content"]
+    except Exception:
+        return {"answer": "I don't know", "citations": [], "confidence": 0.1,
+                "answerable": False}
+
+    raw = str(content).strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        parsed = _json.loads(raw)
+    except Exception:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    # Enforce fields with defaults
+    answer = str(parsed.get("answer") or "").strip()
+    citations = parsed.get("citations") or []
+    if not isinstance(citations, list):
+        citations = []
+    # Drop any hallucinated chunk_ids not in the input
+    citations = [c for c in citations if isinstance(c, str) and c in real_ids]
+    try:
+        confidence = float(parsed.get("confidence", 0.5))
+    except (ValueError, TypeError):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+    answerable = bool(parsed.get("answerable", True))
+
+    # Guardrails: enforce the unanswerable contract
+    def unanswerable_response():
+        return {"answer": "I don't know", "citations": [],
+                "confidence": min(confidence, 0.3),
+                "answerable": False}
+
+    if not answerable or not answer or answer.lower() == "i don't know":
+        return unanswerable_response()
+    # If model claims answerable but produced no citations and low confidence,
+    # treat as unanswerable to stay safe.
+    if not citations and confidence < 0.5:
+        return unanswerable_response()
+
+    return {
+        "answer": answer,
+        "citations": citations,
+        "confidence": confidence,
+        "answerable": True,
+    }
