@@ -22,7 +22,7 @@ ALLOWED_ORIGINS = {
 
 # Paths that must accept any origin (grader sends from a Cloudflare Worker
 # whose subdomain isn't fixed). CORS reflects whatever Origin arrives.
-PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search")
+PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search", "/extract-graph", "/graph-query", "/community-summary")
 
 # (limit, window_seconds) keyed by path prefix; longest prefix wins.
 PATH_LIMITS: Dict[str, Tuple[int, float]] = {
@@ -42,6 +42,9 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/solve": (10_000, 10.0),
     "/grounded-answer": (10_000, 10.0),
     "/vector-search": (10_000, 10.0),
+    "/extract-graph": (10_000, 10.0),
+    "/graph-query": (10_000, 10.0),
+    "/community-summary": (10_000, 10.0),
 }
 DEFAULT_LIMIT: Tuple[int, float] = (20, 10.0)
 
@@ -1953,3 +1956,205 @@ async def vector_search(request: Request):
     matches = [d for _, d in reranked[:rerank_top_n]]
 
     return {"matches": matches}
+
+
+# ---------- GraphRAG: 3 LLM-backed endpoints ----------
+async def _llm_json(system_prompt: str, user_prompt: str, timeout: float = 30.0) -> dict:
+    """Call gpt-4o-mini via AI Pipe, return parsed JSON. Raises on failure."""
+    token = os.environ.get("AIPIPE_TOKEN", "").strip()
+    if not token:
+        raise HTTPException(status_code=500, detail="AIPIPE_TOKEN not configured")
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(
+            f"{AIPIPE_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"},
+            json=payload,
+        )
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502,
+                            detail=f"upstream {r.status_code}: {r.text[:300]}")
+    try:
+        content = r.json()["choices"][0]["message"]["content"]
+    except Exception:
+        raise HTTPException(status_code=502,
+                            detail=f"unexpected upstream shape: {r.text[:300]}")
+    raw = str(content).strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        parsed = _json.loads(raw)
+    except Exception:
+        parsed = {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+EXTRACT_GRAPH_SYSTEM = (
+    "You extract a knowledge graph from a text chunk. Identify entities "
+    "and relationships, then return them as JSON.\n\n"
+    "Entity types (use exactly these): Person, Organization, Product, Framework.\n"
+    "Relationship types (use exactly these uppercase forms): FOUNDED, "
+    "DEVELOPED, INTEGRATED_INTO, HIRED, AUTHORED, CREATED, WORKS_AT.\n\n"
+    "Return ONE JSON object with exactly these keys:\n"
+    "  entities: list of {name: string, type: string}\n"
+    "  relationships: list of {source: string, target: string, relation: string}\n\n"
+    "Rules:\n"
+    "  - Every 'source' and 'target' MUST be a name that appears in entities.\n"
+    "  - Use the exact surface name from the text (case-preserved).\n"
+    "  - Do NOT invent entities not present in the text.\n"
+    "  - Output ONLY the JSON object. No prose, no markdown fences."
+)
+
+
+@app.post("/extract-graph")
+async def extract_graph(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return {"entities": [], "relationships": []}
+
+    try:
+        parsed = await _llm_json(EXTRACT_GRAPH_SYSTEM,
+                                 f"TEXT:\n{text}\n\nReturn the JSON.")
+    except Exception:
+        return {"entities": [], "relationships": []}
+
+    ents = parsed.get("entities") or []
+    rels = parsed.get("relationships") or []
+    if not isinstance(ents, list): ents = []
+    if not isinstance(rels, list): rels = []
+
+    clean_ents = []
+    names = set()
+    for e in ents:
+        if not isinstance(e, dict): continue
+        n = str(e.get("name") or "").strip()
+        t = str(e.get("type") or "").strip()
+        if n and t and n not in names:
+            names.add(n)
+            clean_ents.append({"name": n, "type": t})
+
+    clean_rels = []
+    for r in rels:
+        if not isinstance(r, dict): continue
+        s = str(r.get("source") or "").strip()
+        t = str(r.get("target") or "").strip()
+        rel = str(r.get("relation") or "").strip()
+        if s and t and rel and s in names and t in names:
+            clean_rels.append({"source": s, "target": t, "relation": rel})
+
+    return {"entities": clean_ents, "relationships": clean_rels}
+
+
+GRAPH_QUERY_SYSTEM = (
+    "You perform multi-hop reasoning over a small knowledge graph to answer "
+    "a natural-language question. The graph is given as a JSON object with "
+    "'entities' and 'relationships' arrays.\n\n"
+    "Return a JSON object with EXACTLY these keys:\n"
+    "  answer: string - the final answer entity name (or short factual "
+    "phrase). Use the exact entity name from the graph if applicable.\n"
+    "  reasoning_path: list of entity names traversed, from the anchor "
+    "entity in the question through each hop to the answer entity. Order "
+    "matters. Example: ['OpenAI','LangChain','Harrison Chase'].\n"
+    "  hops: integer - the number of edges traversed (length of "
+    "reasoning_path minus 1).\n\n"
+    "Rules:\n"
+    "  - Only use entities and relationships present in the graph.\n"
+    "  - reasoning_path[0] must be the entity most directly referenced by "
+    "the question. reasoning_path[-1] must be the answer.\n"
+    "  - Output ONLY the JSON object. No prose, no markdown."
+)
+
+
+@app.post("/graph-query")
+async def graph_query(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
+    question = str(body.get("question") or "").strip()
+    graph = body.get("graph") or {}
+    if not question:
+        return {"answer": "", "reasoning_path": [], "hops": 0}
+
+    prompt = (
+        f"QUESTION:\n{question}\n\n"
+        f"GRAPH:\n{_json.dumps(graph, ensure_ascii=False)}\n\n"
+        "Return the JSON."
+    )
+    try:
+        parsed = await _llm_json(GRAPH_QUERY_SYSTEM, prompt)
+    except Exception:
+        return {"answer": "", "reasoning_path": [], "hops": 0}
+
+    answer = str(parsed.get("answer") or "").strip()
+    path = parsed.get("reasoning_path") or []
+    if not isinstance(path, list):
+        path = []
+    path = [str(x).strip() for x in path if str(x).strip()]
+    try:
+        hops = int(parsed.get("hops", max(0, len(path) - 1)))
+    except (ValueError, TypeError):
+        hops = max(0, len(path) - 1)
+    # Keep hops consistent with path
+    if path and hops != len(path) - 1:
+        hops = len(path) - 1
+    return {"answer": answer, "reasoning_path": path, "hops": hops}
+
+
+COMMUNITY_SUMMARY_SYSTEM = (
+    "You are given a sub-community of a knowledge graph — a set of entity "
+    "names and the relationships that connect them. Produce a single-sentence "
+    "summary of what this community is about: what the central entity is and "
+    "how the others relate to it.\n\n"
+    "Return a JSON object with EXACTLY these keys:\n"
+    "  community_id: string - echo the community_id you were given.\n"
+    "  summary: string - one plain-English sentence that describes the "
+    "community.\n\n"
+    "Output ONLY the JSON object. No prose, no markdown."
+)
+
+
+@app.post("/community-summary")
+async def community_summary(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
+
+    cid = str(body.get("community_id") or "")
+    entities = body.get("entities") or []
+    relationships = body.get("relationships") or []
+
+    prompt = (
+        f"COMMUNITY_ID: {cid}\n"
+        f"ENTITIES: {_json.dumps(entities, ensure_ascii=False)}\n"
+        f"RELATIONSHIPS: {_json.dumps(relationships, ensure_ascii=False)}\n\n"
+        "Return the JSON."
+    )
+    try:
+        parsed = await _llm_json(COMMUNITY_SUMMARY_SYSTEM, prompt)
+    except Exception:
+        return {"community_id": cid, "summary": ""}
+
+    summary = str(parsed.get("summary") or "").strip()
+    return {"community_id": cid, "summary": summary}
