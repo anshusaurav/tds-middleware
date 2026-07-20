@@ -22,7 +22,7 @@ ALLOWED_ORIGINS = {
 
 # Paths that must accept any origin (grader sends from a Cloudflare Worker
 # whose subdomain isn't fixed). CORS reflects whatever Origin arrives.
-PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer")
+PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search")
 
 # (limit, window_seconds) keyed by path prefix; longest prefix wins.
 PATH_LIMITS: Dict[str, Tuple[int, float]] = {
@@ -41,6 +41,7 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/rank": (10_000, 10.0),
     "/solve": (10_000, 10.0),
     "/grounded-answer": (10_000, 10.0),
+    "/vector-search": (10_000, 10.0),
 }
 DEFAULT_LIMIT: Tuple[int, float] = (20, 10.0)
 
@@ -1819,3 +1820,136 @@ async def grounded_answer(request: Request):
         "confidence": confidence,
         "answerable": True,
     }
+
+
+# ---------- Two-stage vector search + rerank ----------
+import csv as _csv
+import os.path as _osp
+
+_DATA_DIR = _osp.join(_osp.dirname(_osp.abspath(__file__)), "data")
+_VS_DOCS = []          # list of dicts with doc_id, department, year (int), region, ...
+_VS_EMBS = {}          # doc_id -> vector
+_VS_RERANK = {}        # query_id -> {doc_id -> score}
+
+
+def _vs_load():
+    global _VS_DOCS, _VS_EMBS, _VS_RERANK
+    try:
+        with open(_osp.join(_DATA_DIR, "documents.csv"), encoding="utf-8") as f:
+            rd = _csv.DictReader(f)
+            docs = []
+            for r in rd:
+                # Coerce year to int if possible
+                y = r.get("year")
+                try:
+                    r["_year_int"] = int(y)
+                except (ValueError, TypeError):
+                    r["_year_int"] = None
+                docs.append(r)
+            _VS_DOCS = docs
+        with open(_osp.join(_DATA_DIR, "embeddings.json"), encoding="utf-8") as f:
+            _VS_EMBS = _json.load(f)
+        with open(_osp.join(_DATA_DIR, "reranker_scores.json"), encoding="utf-8") as f:
+            _VS_RERANK = _json.load(f)
+    except Exception:
+        _VS_DOCS, _VS_EMBS, _VS_RERANK = [], {}, {}
+
+
+_vs_load()
+
+
+def _match_filter(doc: dict, flt: dict) -> bool:
+    for field, spec in (flt or {}).items():
+        # Support "year" (may be numeric spec) and other string fields
+        if isinstance(spec, dict):
+            # {"gte": x} / {"lte": x} / {"in": [...]}
+            for op, val in spec.items():
+                op_l = op.lower()
+                if op_l in ("gte", "$gte"):
+                    v = doc.get("_year_int") if field == "year" else doc.get(field)
+                    try:
+                        if v is None or float(v) < float(val):
+                            return False
+                    except (ValueError, TypeError):
+                        return False
+                elif op_l in ("lte", "$lte"):
+                    v = doc.get("_year_int") if field == "year" else doc.get(field)
+                    try:
+                        if v is None or float(v) > float(val):
+                            return False
+                    except (ValueError, TypeError):
+                        return False
+                elif op_l in ("in", "$in"):
+                    v = doc.get(field)
+                    if not isinstance(val, list) or v not in val:
+                        return False
+                elif op_l in ("eq", "$eq"):
+                    if str(doc.get(field)) != str(val):
+                        return False
+                else:
+                    # Unknown operator - fail closed
+                    return False
+        else:
+            # Exact match
+            if str(doc.get(field)) != str(spec):
+                return False
+    return True
+
+
+def _cos_vs(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    na = 0.0
+    nb = 0.0
+    for x in a: na += x * x
+    for x in b: nb += x * x
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na ** 0.5 * nb ** 0.5)
+
+
+@app.post("/vector-search")
+async def vector_search(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
+
+    qid = str(body.get("query_id") or "")
+    qvec = body.get("query_vector") or []
+    top_k = int(body.get("top_k") or 10)
+    rerank_top_n = int(body.get("rerank_top_n") or 3)
+    flt = body.get("filter") or {}
+    if not isinstance(qvec, list) or not isinstance(flt, dict):
+        raise HTTPException(status_code=422, detail="invalid query_vector/filter")
+
+    # Stage 1: filter, cosine, top_k with lex tie-break
+    candidates = []
+    for doc in _VS_DOCS:
+        if not _match_filter(doc, flt):
+            continue
+        emb = _VS_EMBS.get(doc["doc_id"])
+        if emb is None:
+            continue
+        sim = _cos_vs(qvec, emb)
+        candidates.append((sim, doc["doc_id"]))
+
+    # Sort desc by sim, tie-break by lex smaller doc_id ascending
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    stage1 = candidates[:top_k]
+
+    # Stage 2: reranker lookup
+    rr = _VS_RERANK.get(qid, {})
+    reranked = []
+    for _, did in stage1:
+        try:
+            score = float(rr.get(did, 0.0))
+        except (ValueError, TypeError):
+            score = 0.0
+        reranked.append((score, did))
+    # Sort desc by rerank score, tie-break by lex smaller doc_id
+    reranked.sort(key=lambda x: (-x[0], x[1]))
+    matches = [d for _, d in reranked[:rerank_top_n]]
+
+    return {"matches": matches}
