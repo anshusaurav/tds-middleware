@@ -4,3 +4,4 @@ httpx
 pandas
 numpy
 python-multipart
+cryptography
