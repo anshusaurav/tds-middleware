@@ -22,7 +22,7 @@ ALLOWED_ORIGINS = {
 
 # Paths that must accept any origin (grader sends from a Cloudflare Worker
 # whose subdomain isn't fixed). CORS reflects whatever Origin arrives.
-PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search", "/extract-graph", "/graph-query", "/community-summary", "/proration", "/guardrail", "/scan-skill")
+PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search", "/extract-graph", "/graph-query", "/community-summary", "/proration", "/guardrail", "/scan-skill", "/run-guard")
 
 # (limit, window_seconds) keyed by path prefix; longest prefix wins.
 PATH_LIMITS: Dict[str, Tuple[int, float]] = {
@@ -43,6 +43,7 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/proration": (10_000, 10.0),
     "/guardrail": (10_000, 10.0),
     "/scan-skill": (10_000, 10.0),
+    "/run-guard": (10_000, 10.0),
     "/grounded-answer": (10_000, 10.0),
     "/vector-search": (10_000, 10.0),
     "/extract-graph": (10_000, 10.0),
@@ -2545,3 +2546,94 @@ async def scan_skill(request: Request):
     order = ["hardcoded_secret", "prompt_injection",
              "excessive_permissions", "unclear_provenance"]
     return {"categories": [c for c in order if c in final]}
+
+
+# ---------- Run budget & loop guard ----------
+def _rg_norm_args(args) -> str:
+    """Canonical signature of an args object: drop trace_id, collapse
+    whitespace inside string values, sort keys recursively."""
+    def norm(v):
+        if isinstance(v, str):
+            return re.sub(r"\s+", " ", v).strip()
+        if isinstance(v, list):
+            return [norm(x) for x in v]
+        if isinstance(v, dict):
+            return {k: norm(v[k]) for k in v
+                    if k != "trace_id"}
+        return v
+    try:
+        cleaned = norm(args if isinstance(args, dict) else {})
+    except Exception:
+        cleaned = {}
+    return _json.dumps(cleaned, sort_keys=True, ensure_ascii=False)
+
+
+def _rg_sig(step) -> str:
+    tool = str(step.get("tool", "")) if isinstance(step, dict) else ""
+    args = step.get("args", {}) if isinstance(step, dict) else {}
+    return tool + "|" + _rg_norm_args(args)
+
+
+@app.post("/run-guard")
+async def run_guard(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return {"decision": "continue", "reason": "Unparseable body; defaulting to continue."}
+    if not isinstance(body, dict):
+        return {"decision": "continue", "reason": "Invalid body; defaulting to continue."}
+
+    try:
+        budget = float(body.get("budget_tokens") or 0)
+    except (ValueError, TypeError):
+        budget = 0.0
+    steps = body.get("steps") or []
+    if not isinstance(steps, list):
+        steps = []
+
+    # ---- Budget rule ----
+    total = 0.0
+    for s in steps:
+        if isinstance(s, dict):
+            try:
+                total += float(s.get("tokens_used") or 0)
+            except (ValueError, TypeError):
+                pass
+    if budget > 0 and total >= budget:
+        return {"decision": "halt",
+                "reason": f"Budget spent: {int(total)} of {int(budget)} tokens used."}
+
+    sigs = [_rg_sig(s) for s in steps if isinstance(s, dict)]
+    n = len(sigs)
+
+    # ---- Loop A: >=3 identical (tool+args) calls in a row at the tail ----
+    if n >= 3:
+        run = 1
+        for i in range(n - 1, 0, -1):
+            if sigs[i] == sigs[i - 1]:
+                run += 1
+            else:
+                break
+        if run >= 3:
+            return {"decision": "halt",
+                    "reason": f"Loop: same tool+args repeated {run} times in a row."}
+
+    # ---- Loop B: 2-step A,B,A,B cycle over >=6 trailing steps ----
+    if n >= 6:
+        # length of trailing alternating run (period 2, A != B)
+        A = sigs[n - 2]
+        B = sigs[n - 1]
+        if A != B:
+            run = 2
+            for i in range(n - 3, -1, -1):
+                expected = A if ((n - 1 - i) % 2 == 1) else B
+                if sigs[i] == expected:
+                    run += 1
+                else:
+                    break
+            if run >= 6:
+                return {"decision": "halt",
+                        "reason": f"Loop: 2-step cycle repeating over {run} trailing steps."}
+
+    return {"decision": "continue",
+            "reason": f"Under budget ({int(total)}/{int(budget)} tokens); no loop detected."}
