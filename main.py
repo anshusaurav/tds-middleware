@@ -2934,15 +2934,18 @@ async def redteam_guardrail(request: Request):
     args = body.get("arguments") or body.get("args") or {}
     if not isinstance(args, dict):
         args = {}
+    # Accept the argument either nested in `arguments` or at the top level.
+    path = args.get("path") or body.get("path")
+    url = args.get("url") or body.get("url")
 
     if tool == "read_file":
-        allowed, reason, result = _rt_read_file(args.get("path"))
+        allowed, reason, result = _rt_read_file(path)
         if allowed:
             return {"action": "allow", "reason": reason, "result": result}
         return {"action": "block", "reason": reason}
 
     if tool == "fetch_url":
-        allowed, reason, result = await _rt_fetch_url(args.get("url"))
+        allowed, reason, result = await _rt_fetch_url(url)
         if allowed:
             return {"action": "allow", "reason": reason, "result": result}
         return {"action": "block", "reason": reason}
@@ -4020,6 +4023,13 @@ async def inc_receipts(run_id: str, request: Request):
     resp = {"runId": run_id, "status": "waiting", "dispatches": [], "approvals": []}
     run["_last_waiting"] = resp
     return JSONResponse(resp)
+
+
+@app.post("/v2/incidents/{run_id}/{sub}")
+async def inc_receipts_alias(run_id: str, sub: str, request: Request):
+    # The grader may POST receipts to /{runId}/receipts or /{runId}/incidents;
+    # route any sub-path under a run to the receipts handler.
+    return await inc_receipts(run_id, request)
 
 
 @app.get("/v2/incidents/{run_id}")
