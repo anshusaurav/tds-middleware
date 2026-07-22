@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import os
 import re
 import time
@@ -22,7 +23,7 @@ ALLOWED_ORIGINS = {
 
 # Paths that must accept any origin (grader sends from a Cloudflare Worker
 # whose subdomain isn't fixed). CORS reflects whatever Origin arrives.
-PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search", "/extract-graph", "/graph-query", "/community-summary", "/proration", "/guardrail", "/scan-skill", "/run-guard")
+PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search", "/extract-graph", "/graph-query", "/community-summary", "/proration", "/guardrail", "/scan-skill", "/run-guard", "/mcp")
 
 # (limit, window_seconds) keyed by path prefix; longest prefix wins.
 PATH_LIMITS: Dict[str, Tuple[int, float]] = {
@@ -44,6 +45,7 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/guardrail": (10_000, 10.0),
     "/scan-skill": (10_000, 10.0),
     "/run-guard": (10_000, 10.0),
+    "/mcp": (10_000, 10.0),
     "/grounded-answer": (10_000, 10.0),
     "/vector-search": (10_000, 10.0),
     "/extract-graph": (10_000, 10.0),
@@ -2637,3 +2639,103 @@ async def run_guard(request: Request):
 
     return {"decision": "continue",
             "reason": f"Under budget ({int(total)}/{int(budget)} tokens); no loop detected."}
+
+
+# ---------- Minimal MCP server (Streamable HTTP) ----------
+MCP_EMAIL = "25f1002017@ds.study.iitm.ac.in"
+MCP_PROTO_DEFAULT = "2025-06-18"
+
+
+def _mcp_solve(challenge: str) -> str:
+    digest = hashlib.sha256(f"{challenge}:{MCP_EMAIL}".encode()).hexdigest()
+    return digest[:16]
+
+
+def _mcp_result(msg_id, result):
+    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+
+def _mcp_error(msg_id, code, message):
+    return {"jsonrpc": "2.0", "id": msg_id,
+            "error": {"code": code, "message": message}}
+
+
+async def _mcp_handle(request: Request):
+    session_id = request.headers.get("mcp-session-id") or uuid.uuid4().hex
+    challenge = request.headers.get("x-exam-challenge", "")
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(_mcp_error(None, -32700, "Parse error"), status_code=400)
+
+    # Batches are not used by the current protocol, but tolerate a list.
+    messages = body if isinstance(body, list) else [body]
+    responses = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        method = msg.get("method")
+        mid = msg.get("id")
+        is_notification = "id" not in msg
+
+        if method == "initialize":
+            params = msg.get("params") or {}
+            proto = params.get("protocolVersion") or MCP_PROTO_DEFAULT
+            responses.append(_mcp_result(mid, {
+                "protocolVersion": proto,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "tds-exam-mcp", "version": "1.0.0"},
+            }))
+        elif method in ("notifications/initialized", "initialized",
+                        "notifications/cancelled", "ping"):
+            if method == "ping" and not is_notification:
+                responses.append(_mcp_result(mid, {}))
+            # notifications produce no response
+        elif method == "tools/list":
+            responses.append(_mcp_result(mid, {
+                "tools": [{
+                    "name": "solve_challenge",
+                    "description": "Return the challenge response derived from the "
+                                   "per-call X-Exam-Challenge header.",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }]
+            }))
+        elif method == "tools/call":
+            params = msg.get("params") or {}
+            name = params.get("name")
+            if name == "solve_challenge":
+                text = _mcp_solve(challenge)
+                responses.append(_mcp_result(mid, {
+                    "content": [{"type": "text", "text": text}],
+                    "isError": False,
+                }))
+            else:
+                responses.append(_mcp_error(mid, -32602, f"Unknown tool: {name}"))
+        else:
+            if not is_notification:
+                responses.append(_mcp_error(mid, -32601, f"Method not found: {method}"))
+
+    headers = {"Mcp-Session-Id": session_id}
+    if not responses:
+        # All messages were notifications.
+        return Response(status_code=202, headers=headers)
+    payload = responses[0] if len(responses) == 1 else responses
+    return JSONResponse(payload, headers=headers)
+
+
+@app.post("/mcp")
+async def mcp_post(request: Request):
+    return await _mcp_handle(request)
+
+
+@app.get("/mcp")
+async def mcp_get():
+    # No server-initiated SSE stream offered at this endpoint.
+    return Response(status_code=405, headers={"Allow": "POST"})
+
+
+@app.delete("/mcp")
+async def mcp_delete():
+    # Session teardown -- acknowledge.
+    return Response(status_code=204)
