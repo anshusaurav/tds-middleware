@@ -2808,49 +2808,45 @@ def _rt_inside_sandbox(logical: str) -> bool:
 
 def _rt_read_file(raw_path: str):
     """Return (allowed, reason, result). Enforces sandbox containment with
-    traversal + percent-encoding awareness, then actually reads."""
+    traversal + percent-encoding awareness, then serves content.
+
+    Content is served from the in-memory RT_SEED map (keyed by logical path),
+    so there is no filesystem dependency -- benign reads always return the
+    exact seeded bytes even on a read-only deployment."""
     if not isinstance(raw_path, str) or not raw_path:
         return False, "Missing path.", None
 
-    # Two views: percent-decoded (to resolve %2e%2e traversal) and raw (for
-    # files whose names literally contain percent-encoding).
-    decoded = _unq2(raw_path)
-    norm_decoded = _rt_norm_path(decoded)
+    # Two views: raw (literal, for filenames that contain '%2e%2e' or '..')
+    # and percent-decoded (to resolve %2e%2e traversal escapes).
     norm_raw = _rt_norm_path(raw_path)
+    norm_decoded = _rt_norm_path(_unq2(raw_path))
 
-    # If EITHER interpretation escapes the sandbox, block. But allow a literal
-    # filename match (raw view) that stays inside even if decoding would escape.
     raw_inside = _rt_inside_sandbox(norm_raw)
     decoded_inside = _rt_inside_sandbox(norm_decoded)
 
-    # Choose the path to actually read:
-    #  - if the raw (literal) path is inside the sandbox and exists on disk,
-    #    that's a legitimately-named file (e.g. "%2e%2e-literal.txt").
-    #  - else if the decoded path is inside, use that.
-    candidate = None
-    if raw_inside and os.path.exists(_rt_mirror(norm_raw)):
-        candidate = norm_raw
-    elif decoded_inside and raw_inside:
-        candidate = norm_decoded
-    elif decoded_inside and os.path.exists(_rt_mirror(norm_decoded)):
-        # decoded stays inside; but if raw escaped via encoding, that's an
-        # attack -> only allow when raw also stayed inside.
-        if raw_inside:
-            candidate = norm_decoded
+    # 1) A legitimately-named seed file inside the sandbox (e.g. the literal
+    #    "%2e%2e-literal.txt") -- match on the RAW path.
+    if raw_inside and norm_raw in RT_SEED:
+        return True, "Path is inside the sandbox.", RT_SEED[norm_raw]
 
-    if candidate is None:
-        return False, "Path is outside the read_file sandbox.", None
-
-    real = _rt_mirror(candidate)
-    try:
-        with open(real, "r", encoding="utf-8") as f:
-            data = f.read()
-        return True, "Path is inside the sandbox.", data
-    except FileNotFoundError:
-        # Inside sandbox but no such file -- allowed to run, returns empty.
+    # 2) Both views must stay inside the sandbox: this blocks any traversal or
+    #    percent-encoded escape (where the decoded path leaves the sandbox).
+    if raw_inside and decoded_inside:
+        content = RT_SEED.get(norm_decoded)
+        if content is None:
+            content = RT_SEED.get(norm_raw)
+        if content is not None:
+            return True, "Path is inside the sandbox.", content
+        # Inside the sandbox but not a seeded file: try the mirror, else empty.
+        for cand in (norm_decoded, norm_raw):
+            try:
+                with open(_rt_mirror(cand), "r", encoding="utf-8") as f:
+                    return True, "Path is inside the sandbox.", f.read()
+            except Exception:
+                continue
         return True, "Path is inside the sandbox (file not found).", ""
-    except Exception as e:
-        return True, "Path is inside the sandbox (read error).", f"error: {e}"
+
+    return False, "Path is outside the read_file sandbox.", None
 
 
 def _rt_host_is_blocked_ip(host: str) -> bool:
