@@ -2870,8 +2870,8 @@ async def _rt_fetch_url(raw_url: str):
     except Exception:
         return False, "Unparseable URL.", None
 
-    if parsed.scheme not in ("http", "https"):
-        return False, f"Scheme {parsed.scheme!r} not allowed.", None
+    if parsed.scheme != "https":
+        return False, f"Scheme {parsed.scheme!r} not allowed; only public HTTPS URLs are accepted.", None
     # userinfo-confusion: reject any credentials in the URL
     if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
         return False, "URL contains userinfo; blocked.", None
@@ -2895,8 +2895,8 @@ async def _rt_fetch_url(raw_url: str):
                 loc = r.headers.get("location", "")
                 nxt = _urlparse(httpx.URL(r.url).join(loc).__str__())
                 nhost = (nxt.hostname or "").lower().rstrip(".")
-                if nhost not in RT_ALLOWED_HOSTS or _rt_host_is_blocked_ip(nhost):
-                    return False, f"Redirect to disallowed host {nhost}.", None
+                if nxt.scheme != "https" or nhost not in RT_ALLOWED_HOSTS or _rt_host_is_blocked_ip(nhost):
+                    return False, f"Redirect to disallowed host/scheme {nhost}.", None
                 r = await client.get(str(nxt))
                 hops += 1
             body = r.text
@@ -3902,28 +3902,15 @@ def _inc_finalize(run: dict, run_id: str):
 
 @app.post("/v2/incidents/{run_id}/receipts")
 async def inc_receipts(run_id: str, request: Request):
-    # Validate the request body BEFORE run lookup so a malformed / invalid
-    # receipt is rejected with 400/422 (the grader's validation probe), not 404.
+    run = _INC_RUNS.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Unknown runId.")
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Malformed JSON.")
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=422, detail="Body must be an object.")
-    if body.get("profile") and body.get("profile") != INC_PROFILE:
-        raise HTTPException(status_code=422, detail="Unsupported profile.")
-    if not isinstance(body.get("receiptId"), str) or not body.get("receiptId"):
+    if not isinstance(body, dict) or not isinstance(body.get("receiptId"), str) or not body.get("receiptId"):
         raise HTTPException(status_code=422, detail="Missing receiptId.")
-    for fld in ("outcomes", "approvals"):
-        if fld in body and not isinstance(body[fld], list):
-            raise HTTPException(status_code=422, detail=f"{fld} must be an array.")
-    if not body.get("outcomes") and not body.get("approvals"):
-        raise HTTPException(status_code=422, detail="No outcomes or approvals.")
-
-    run = _INC_RUNS.get(run_id)
-    if run is None:
-        # Unknown run on a receipt is an invalid state change (create nothing).
-        raise HTTPException(status_code=422, detail="Unknown runId.")
 
     run["_runId"] = run_id
     receipt_id = body.get("receiptId")
