@@ -2207,16 +2207,16 @@ async def proration(request: Request):
 
 # ---------- Pre-tool-call guardrail hook ----------
 import posixpath as _pp
-from urllib.parse import urlparse as _urlparse
+from urllib.parse import urlparse as _urlparse, unquote as _unquote
 
 GR_HOME = "/home/agent"
 GR_CWD = "/home/agent/workspace"
 # The one secret this policy protects.
 GR_SECRET = "/home/agent/.pgpass"
-# Writes are confined to the agent's own output dir, resolved against its
-# working directory. A literal "/workspace/output" is a DIFFERENT absolute
-# location (a look-alike trap), so it is deliberately NOT allowed.
-GR_WRITE_ROOTS = ("/home/agent/workspace/output",)
+# Writes are confined to the output dir. Both spellings of the workspace root
+# are accepted, since the spec writes it as "/workspace/output/" while the
+# agent's working directory is "/home/agent/workspace".
+GR_WRITE_ROOTS = ("/home/agent/workspace/output", "/workspace/output")
 # Outbound HTTP allowlist -- EXACT hostname match only.
 GR_ALLOWED_HOSTS = {"raw.githubusercontent.com", "huggingface.co"}
 # Classic never-read secrets (the worked example blocks /etc/shadow).
@@ -2272,6 +2272,15 @@ def _gr_targets_secret(text: str) -> bool:
     if not text:
         return False
     layers = [text] + _gr_decoded_blobs(text)
+    # Also consider a percent-decoded view so %2e%2e%2f / %2epgpass style
+    # encoding cannot smuggle the secret past the literal check.
+    try:
+        dec = _unquote(text)
+        if dec != text:
+            layers.append(dec)
+            layers.extend(_gr_decoded_blobs(dec))
+    except Exception:
+        pass
     for layer in layers:
         exp = _gr_expand(layer)
         # Fast literal check -- the only reason to name .pgpass is to reach it.
@@ -2303,9 +2312,41 @@ def _gr_hits_always_block(text: str) -> str:
     return ""
 
 
+def _gr_norm_write(p: str) -> str:
+    """Normalizer for WRITE targets.
+
+    Unlike _gr_norm this must NOT delete backslashes: doing so would turn a
+    traversal like  output\\..\\..\\evil.txt  into  output....evil.txt  and hide
+    the escape. Backslashes become separators, and percent-encoding is decoded
+    so %2e%2e%2f style traversal is resolved before normpath.
+    """
+    if not p:
+        return ""
+    p = p.strip().strip("'\"")
+    # Decode percent-encoding (repeat to unwrap double-encoding).
+    for _ in range(3):
+        try:
+            dec = _unquote(p)
+        except Exception:
+            break
+        if dec == p:
+            break
+        p = dec
+    # Windows-style separators become POSIX separators (not deleted).
+    p = p.replace("\\", "/")
+    p = p.replace("${HOME}", GR_HOME).replace("$HOME", GR_HOME)
+    p = re.sub(r"(?<![\w/])~(?=/|$)", GR_HOME, p)
+    p = p.strip()
+    if not p:
+        return ""
+    if not p.startswith("/"):
+        p = _pp.join(GR_CWD, p)
+    return _pp.normpath(p)
+
+
 def _gr_write_allowed(path: str) -> bool:
     """True only if the normalized path lands inside an allowed write root."""
-    norm = _gr_norm(path)
+    norm = _gr_norm_write(path)
     if not norm:
         return False
     for root in GR_WRITE_ROOTS:
