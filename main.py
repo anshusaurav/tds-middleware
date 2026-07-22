@@ -23,7 +23,7 @@ ALLOWED_ORIGINS = {
 
 # Paths that must accept any origin (grader sends from a Cloudflare Worker
 # whose subdomain isn't fixed). CORS reflects whatever Origin arrives.
-PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search", "/extract-graph", "/graph-query", "/community-summary", "/proration", "/guardrail", "/scan-skill", "/run-guard", "/mcp", "/redteam-guardrail", "/mailroom")
+PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search", "/extract-graph", "/graph-query", "/community-summary", "/proration", "/guardrail", "/scan-skill", "/run-guard", "/mcp", "/redteam-guardrail", "/mailroom", "/a2a", "/.well-known")
 
 # (limit, window_seconds) keyed by path prefix; longest prefix wins.
 PATH_LIMITS: Dict[str, Tuple[int, float]] = {
@@ -3260,3 +3260,300 @@ async def mailroom(request: Request):
     if op == "commit":
         return await _mail_commit(body)
     raise HTTPException(status_code=400, detail=f"Unknown operation {op!r}.")
+
+
+# ---------- Q10: A2A Invoice Agent ----------
+A2A_BASE_PATH = "/a2a"
+A2A_INVOICE_MODE = "application/vnd.ga5.invoice-claim-batch+json"
+A2A_PROPOSALS_MODE = "application/vnd.ga5.invoice-action-proposals+json"
+A2A_RECEIPTS_MODE = "application/vnd.ga5.invoice-action-receipts+json"
+A2A_RESULTS_MODE = "application/vnd.ga5.invoice-action-results+json"
+A2A_ACTIONS = {"settle_invoice", "request_approval", "hold_invoice",
+               "reject_duplicate", "open_exception"}
+
+# principal -> {taskId -> task}, plus idempotency and content caches
+_A2A_TASKS: Dict[str, Dict[str, dict]] = defaultdict(dict)
+_A2A_IDEMPOTENCY: Dict[str, str] = {}          # (principal|messageHash) -> taskId
+_A2A_PKG_CACHE: Dict[str, dict] = {}           # canonical package -> decision
+
+
+def _a2a_principal(request: Request) -> Optional[str]:
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        tok = auth[7:].strip()
+        return tok or None
+    return None
+
+
+def _a2a_base_url(request: Request) -> str:
+    # public base URL the user submitted; reconstruct from request
+    return str(request.base_url).rstrip("/") + A2A_BASE_PATH
+
+
+A2A_PKG_SYSTEM = (
+    "You are an invoice action agent. For ONE invoice package, choose exactly "
+    "one action and cite the three decisive bracketed references from the "
+    "paragraph that determines the action (not the cover sheet, archive "
+    "examples, or training decoys).\n\n"
+    "ACTIONS:\n"
+    "  settle_invoice: valid, reconciled, within autonomous authority.\n"
+    "  request_approval: commercially valid but outside delegated authority.\n"
+    "  hold_invoice: payment pauses until a stated verification completes.\n"
+    "  reject_duplicate: the same commercial invoice was already paid.\n"
+    "  open_exception: material records conflict, needs exception workflow.\n\n"
+    "Documents mix useful facts with old examples, negation, and irrelevant "
+    "action words -- reason about what actually applies now.\n\n"
+    "Return ONLY JSON: {\"action\":\"...\",\"facts\":{\"vendorName\":\"...\","
+    "\"invoiceNumber\":\"...\",\"amountMinor\":<int>,\"currency\":\"...\"},"
+    "\"evidenceRefs\":[\"[ref1]\",\"[ref2]\",\"[ref3]\"],"
+    "\"rationale\":\"60-1500 chars naming the action and citing >=2 refs\"}."
+)
+
+
+async def _a2a_decide(pkg: dict) -> dict:
+    fp = _sha256_hex(_canon(pkg))
+    if fp in _A2A_PKG_CACHE:
+        return _A2A_PKG_CACHE[fp]
+    token = os.environ.get("AIPIPE_TOKEN", "").strip()
+    dec = None
+    if token:
+        try:
+            payload = {
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "system", "content": A2A_PKG_SYSTEM},
+                             {"role": "user",
+                              "content": _json.dumps(pkg, ensure_ascii=False)[:12000]
+                              + "\n\nReturn the JSON."}],
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+            }
+            async with httpx.AsyncClient(timeout=40.0) as client:
+                r = await client.post(f"{AIPIPE_BASE}/chat/completions",
+                                      headers={"Authorization": f"Bearer {token}",
+                                               "Content-Type": "application/json"},
+                                      json=payload)
+            if r.status_code < 400:
+                raw = r.json()["choices"][0]["message"]["content"].strip()
+                if raw.startswith("```"):
+                    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                    raw = re.sub(r"\s*```$", "", raw)
+                dec = _json.loads(raw)
+        except Exception:
+            dec = None
+    if not isinstance(dec, dict) or dec.get("action") not in A2A_ACTIONS:
+        dec = {"action": "open_exception",
+               "facts": {"vendorName": "", "invoiceNumber": "",
+                         "amountMinor": 0, "currency": ""},
+               "evidenceRefs": [], "rationale":
+               "Defaulting to open_exception: unable to reconcile the package "
+               "records with confidence, so an exception workflow is required."}
+    _A2A_PKG_CACHE[fp] = dec
+    return dec
+
+
+def _a2a_card(base_url: str) -> dict:
+    return {
+        "name": "GA5 Invoice Action Agent",
+        "description": "Reads invoice claim batches and proposes one typed "
+                       "action per package, then completes on grader receipts.",
+        "version": "1.0.0",
+        "capabilities": {"streaming": False, "pushNotifications": False},
+        "defaultInputModes": [A2A_INVOICE_MODE],
+        "defaultOutputModes": [A2A_PROPOSALS_MODE, A2A_RECEIPTS_MODE],
+        "supportedInterfaces": [
+            {"url": base_url, "protocolBinding": "HTTP+JSON",
+             "protocolVersion": "1.0"}
+        ],
+        "skills": [{
+            "id": "invoice_action_agent",
+            "name": "Invoice Action Agent",
+            "description": "Chooses settle/approve/hold/reject/exception for "
+                           "each invoice package with cited evidence.",
+            "tags": ["invoice", "finance", "reconciliation", "a2a"],
+        }],
+    }
+
+
+@app.get("/.well-known/agent-card.json")
+async def a2a_agent_card(request: Request):
+    return JSONResponse(_a2a_card(_a2a_base_url(request)),
+                        media_type="application/json")
+
+
+def _a2a_check_headers(request: Request):
+    principal = _a2a_principal(request)
+    if not principal:
+        raise HTTPException(status_code=401, detail="Missing bearer token.")
+    ver = request.headers.get("a2a-version")
+    if ver and ver != "1.0":
+        raise HTTPException(status_code=400, detail="Unsupported A2A-Version.")
+    return principal
+
+
+@app.post(A2A_BASE_PATH + "/message:send")
+async def a2a_message_send(request: Request):
+    principal = _a2a_check_headers(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed JSON.")
+    message = body.get("message") or {}
+    msg_id = message.get("messageId")
+    if not msg_id:
+        raise HTTPException(status_code=400, detail="Missing messageId.")
+
+    msg_hash = _sha256_hex(_canon(message))
+    idem_key = principal + "|" + str(msg_id)
+
+    # idempotency: same messageId
+    if idem_key in _A2A_IDEMPOTENCY:
+        prior_task_id = _A2A_IDEMPOTENCY[idem_key]
+        prior = _A2A_TASKS[principal].get(prior_task_id)
+        if prior is not None:
+            if prior.get("_msgHash") == msg_hash:
+                return JSONResponse({"task": _a2a_public_task(prior)})
+            raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
+
+    parts = message.get("parts") or []
+    # Determine whether this is an initial batch or a results continuation.
+    is_results = any((p.get("mediaType") == A2A_RESULTS_MODE) for p in parts if isinstance(p, dict))
+
+    if is_results:
+        return await _a2a_handle_results(principal, message, msg_hash, idem_key)
+    return await _a2a_handle_initial(principal, message, msg_hash, idem_key)
+
+
+async def _a2a_handle_initial(principal, message, msg_hash, idem_key):
+    parts = message.get("parts") or []
+    data = None
+    for p in parts:
+        if isinstance(p, dict) and p.get("mediaType") == A2A_INVOICE_MODE:
+            data = p.get("data")
+            break
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Missing invoice batch part.")
+    batch_id = data.get("batchId")
+    packages = data.get("packages") or []
+    if not isinstance(packages, list) or not packages:
+        raise HTTPException(status_code=400, detail="No packages.")
+
+    import asyncio as _asyncio
+    sem = _asyncio.Semaphore(8)
+    async def _b(pkg):
+        async with sem:
+            return await _a2a_decide(pkg)
+    decisions = await _asyncio.gather(*[_b(pkg) for pkg in packages])
+
+    proposals = []
+    for pkg, dec in zip(packages, decisions):
+        pid = pkg.get("packageId")
+        proposals.append({
+            "packageId": pid,
+            "actionId": ("act-" + _sha256_hex(_canon(pkg)))[:40],
+            "action": dec["action"],
+            "facts": dec.get("facts") or {},
+            "evidenceRefs": dec.get("evidenceRefs") or [],
+            "rationale": dec.get("rationale") or "",
+        })
+
+    task_id = "task-" + uuid.uuid4().hex
+    context_id = "ctx-" + uuid.uuid4().hex
+    task = {
+        "id": task_id,
+        "contextId": context_id,
+        "status": {"state": "TASK_STATE_INPUT_REQUIRED"},
+        "artifacts": [{
+            "artifactId": "art-proposals-" + uuid.uuid4().hex[:8],
+            "parts": [{"mediaType": A2A_PROPOSALS_MODE,
+                       "data": {"batchId": batch_id, "proposals": proposals}}],
+        }],
+        "history": [message],
+        "_principal": principal,
+        "_msgHash": msg_hash,
+        "_batchId": batch_id,
+        "_proposals": {p["actionId"]: p for p in proposals},
+        "_terminal": False,
+    }
+    _A2A_TASKS[principal][task_id] = task
+    _A2A_IDEMPOTENCY[idem_key] = task_id
+    return JSONResponse({"task": _a2a_public_task(task)})
+
+
+async def _a2a_handle_results(principal, message, msg_hash, idem_key):
+    task_id = message.get("taskId")
+    task = _A2A_TASKS[principal].get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if message.get("contextId") and message.get("contextId") != task["contextId"]:
+        raise HTTPException(status_code=409, detail="Context mismatch.")
+    if task.get("_terminal"):
+        # terminal replay -> return stored task unchanged
+        _A2A_IDEMPOTENCY[idem_key] = task_id
+        return JSONResponse({"task": _a2a_public_task(task)})
+
+    data = None
+    for p in message.get("parts") or []:
+        if isinstance(p, dict) and p.get("mediaType") == A2A_RESULTS_MODE:
+            data = p.get("data")
+            break
+    results = (data or {}).get("results") or []
+    executions = []
+    for res in results:
+        aid = res.get("actionId")
+        prop = task["_proposals"].get(aid)
+        if prop is None or prop["action"] != res.get("action") \
+                or prop["packageId"] != res.get("packageId"):
+            raise HTTPException(status_code=409, detail="Result does not match proposal.")
+        if res.get("outcome") == "ACCEPTED":
+            executions.append({
+                "packageId": prop["packageId"],
+                "actionId": prop["actionId"],
+                "action": prop["action"],
+                "receiptNonce": res.get("receiptNonce"),
+                "facts": prop["facts"],
+                "evidenceRefs": prop["evidenceRefs"],
+            })
+
+    task["artifacts"].append({
+        "artifactId": "art-receipts-" + uuid.uuid4().hex[:8],
+        "parts": [{"mediaType": A2A_RECEIPTS_MODE,
+                   "data": {"batchId": task["_batchId"], "executions": executions}}],
+    })
+    task["history"].append(message)
+    task["status"] = {"state": "TASK_STATE_COMPLETED"}
+    task["_terminal"] = True
+    _A2A_IDEMPOTENCY[idem_key] = task_id
+    return JSONResponse({"task": _a2a_public_task(task)})
+
+
+def _a2a_public_task(task: dict) -> dict:
+    return {k: v for k, v in task.items() if not k.startswith("_")}
+
+
+@app.get(A2A_BASE_PATH + "/tasks/{task_id}")
+async def a2a_get_task(task_id: str, request: Request):
+    principal = _a2a_check_headers(request)
+    task = _A2A_TASKS[principal].get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return JSONResponse(_a2a_public_task(task))
+
+
+@app.get(A2A_BASE_PATH + "/tasks")
+async def a2a_list_tasks(request: Request):
+    principal = _a2a_check_headers(request)
+    tasks = [_a2a_public_task(t) for t in _A2A_TASKS[principal].values()]
+    return JSONResponse({"tasks": tasks})
+
+
+@app.post(A2A_BASE_PATH + "/tasks/{task_id}:cancel")
+async def a2a_cancel_task(task_id: str, request: Request):
+    principal = _a2a_check_headers(request)
+    task = _A2A_TASKS[principal].get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Not found.")
+    if task.get("_terminal"):
+        raise HTTPException(status_code=409, detail="Task already terminal.")
+    task["status"] = {"state": "TASK_STATE_CANCELED"}
+    task["_terminal"] = True
+    return JSONResponse(_a2a_public_task(task))
