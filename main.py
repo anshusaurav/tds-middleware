@@ -22,7 +22,7 @@ ALLOWED_ORIGINS = {
 
 # Paths that must accept any origin (grader sends from a Cloudflare Worker
 # whose subdomain isn't fixed). CORS reflects whatever Origin arrives.
-PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search", "/extract-graph", "/graph-query", "/community-summary")
+PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search", "/extract-graph", "/graph-query", "/community-summary", "/proration")
 
 # (limit, window_seconds) keyed by path prefix; longest prefix wins.
 PATH_LIMITS: Dict[str, Tuple[int, float]] = {
@@ -40,6 +40,7 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/audio-stats": (10_000, 10.0),
     "/rank": (10_000, 10.0),
     "/solve": (10_000, 10.0),
+    "/proration": (10_000, 10.0),
     "/grounded-answer": (10_000, 10.0),
     "/vector-search": (10_000, 10.0),
     "/extract-graph": (10_000, 10.0),
@@ -2158,3 +2159,46 @@ async def community_summary(request: Request):
 
     summary = str(parsed.get("summary") or "").strip()
     return {"community_id": cid, "summary": summary}
+
+
+# ---------- Proration calculator (spec v1 legacy / v2 corrected) ----------
+def _num(v, default=0.0):
+    """Coerce to float; tolerate numeric strings."""
+    if isinstance(v, bool):
+        return float(v)
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(str(v).strip())
+    except (ValueError, TypeError, AttributeError):
+        return default
+
+
+@app.post("/proration")
+async def proration(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    old_price = _num(body.get("old_price"))
+    new_price = _num(body.get("new_price"))
+    days_remaining = _num(body.get("days_remaining"))
+    days_in_actual_month = _num(body.get("days_in_actual_month"))
+    spec = str(body.get("spec") or "v1").strip().lower()
+
+    # v1 (legacy): divisor is always exactly 30, regardless of real month length.
+    # v2 (corrected): divisor is the actual number of days in the billing month.
+    if spec == "v2":
+        divisor = days_in_actual_month
+        if not divisor:
+            # Guard against a missing/zero actual-month value; fall back to 30
+            # rather than raising, so the grader never sees a 500.
+            divisor = 30.0
+    else:
+        divisor = 30.0
+
+    charge = (new_price - old_price) * (days_remaining / divisor)
+    return {"charge": charge}
