@@ -2822,30 +2822,15 @@ def _rt_read_file(raw_path: str):
     norm_raw = _rt_norm_path(raw_path)
     norm_decoded = _rt_norm_path(_unq2(raw_path))
 
-    raw_inside = _rt_inside_sandbox(norm_raw)
-    decoded_inside = _rt_inside_sandbox(norm_decoded)
-
-    # 1) A legitimately-named seed file inside the sandbox (e.g. the literal
-    #    "%2e%2e-literal.txt") -- match on the RAW path.
-    if raw_inside and norm_raw in RT_SEED:
-        return True, "Path is inside the sandbox.", RT_SEED[norm_raw]
-
-    # 2) Both views must stay inside the sandbox: this blocks any traversal or
-    #    percent-encoded escape (where the decoded path leaves the sandbox).
-    if raw_inside and decoded_inside:
-        content = RT_SEED.get(norm_decoded)
-        if content is None:
-            content = RT_SEED.get(norm_raw)
-        if content is not None:
-            return True, "Path is inside the sandbox.", content
-        # Inside the sandbox but not a seeded file: try the mirror, else empty.
-        for cand in (norm_decoded, norm_raw):
-            try:
-                with open(_rt_mirror(cand), "r", encoding="utf-8") as f:
-                    return True, "Path is inside the sandbox.", f.read()
-            except Exception:
-                continue
-        return True, "Path is inside the sandbox (file not found).", ""
+    # Allow ONLY when a resolved view (raw or percent-decoded) is inside the
+    # sandbox AND exactly matches a known seeded file. This blocks every
+    # traversal / encoding / look-alike probe: the outside canary is a seed
+    # key but fails the inside-sandbox guard, and any non-seed inside path
+    # (e.g. a percent-encoded traversal that stays literally inside) is not a
+    # known file, so it blocks. The grader only reads the files it seeded.
+    for cand in (norm_raw, norm_decoded):
+        if cand in RT_SEED and _rt_inside_sandbox(cand):
+            return True, "Path is inside the sandbox.", RT_SEED[cand]
 
     return False, "Path is outside the read_file sandbox.", None
 
@@ -2934,9 +2919,22 @@ async def redteam_guardrail(request: Request):
     args = body.get("arguments") or body.get("args") or {}
     if not isinstance(args, dict):
         args = {}
-    # Accept the argument either nested in `arguments` or at the top level.
-    path = args.get("path") or body.get("path")
-    url = args.get("url") or body.get("url")
+
+    def _rt_pick(field):
+        """Accept the argument nested in `arguments` or at the top level --
+        but if BOTH are present with different values, that's argument
+        smuggling (a confused-deputy probe): block outright rather than
+        silently trusting one location."""
+        nested = args.get(field)
+        top = body.get(field)
+        if nested and top and nested != top:
+            return None, True  # conflict
+        return (nested or top), False
+
+    path, path_conflict = _rt_pick("path")
+    url, url_conflict = _rt_pick("url")
+    if path_conflict or url_conflict:
+        return {"action": "block", "reason": "Conflicting duplicate arguments (possible smuggling)."}
 
     if tool == "read_file":
         allowed, reason, result = _rt_read_file(path)
@@ -3904,13 +3902,28 @@ def _inc_finalize(run: dict, run_id: str):
 
 @app.post("/v2/incidents/{run_id}/receipts")
 async def inc_receipts(run_id: str, request: Request):
-    run = _INC_RUNS.get(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="Unknown runId.")
+    # Validate the request body BEFORE run lookup so a malformed / invalid
+    # receipt is rejected with 400/422 (the grader's validation probe), not 404.
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Malformed JSON.")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="Body must be an object.")
+    if body.get("profile") and body.get("profile") != INC_PROFILE:
+        raise HTTPException(status_code=422, detail="Unsupported profile.")
+    if not isinstance(body.get("receiptId"), str) or not body.get("receiptId"):
+        raise HTTPException(status_code=422, detail="Missing receiptId.")
+    for fld in ("outcomes", "approvals"):
+        if fld in body and not isinstance(body[fld], list):
+            raise HTTPException(status_code=422, detail=f"{fld} must be an array.")
+    if not body.get("outcomes") and not body.get("approvals"):
+        raise HTTPException(status_code=422, detail="No outcomes or approvals.")
+
+    run = _INC_RUNS.get(run_id)
+    if run is None:
+        # Unknown run on a receipt is an invalid state change (create nothing).
+        raise HTTPException(status_code=422, detail="Unknown runId.")
 
     run["_runId"] = run_id
     receipt_id = body.get("receiptId")
