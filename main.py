@@ -3266,6 +3266,11 @@ A2A_RECEIPTS_MODE = "application/vnd.ga5.invoice-action-receipts+json"
 A2A_RESULTS_MODE = "application/vnd.ga5.invoice-action-results+json"
 A2A_ACTIONS = {"settle_invoice", "request_approval", "hold_invoice",
                "reject_duplicate", "open_exception"}
+A2A_MT = "application/a2a+json"
+
+
+def _a2a_json(payload, status_code: int = 200):
+    return JSONResponse(payload, status_code=status_code, media_type=A2A_MT)
 
 # principal -> {taskId -> task}, plus idempotency and content caches
 _A2A_TASKS: Dict[str, Dict[str, dict]] = defaultdict(dict)
@@ -3407,7 +3412,7 @@ async def a2a_message_send(request: Request):
         prior = _A2A_TASKS[principal].get(prior_task_id)
         if prior is not None:
             if prior.get("_msgHash") == msg_hash:
-                return JSONResponse({"task": _a2a_public_task(prior)})
+                return _a2a_json({"task": _a2a_public_task(prior)})
             raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
 
     parts = message.get("parts") or []
@@ -3472,7 +3477,7 @@ async def _a2a_handle_initial(principal, message, msg_hash, idem_key):
     }
     _A2A_TASKS[principal][task_id] = task
     _A2A_IDEMPOTENCY[idem_key] = task_id
-    return JSONResponse({"task": _a2a_public_task(task)})
+    return _a2a_json({"task": _a2a_public_task(task)})
 
 
 async def _a2a_handle_results(principal, message, msg_hash, idem_key):
@@ -3485,7 +3490,7 @@ async def _a2a_handle_results(principal, message, msg_hash, idem_key):
     if task.get("_terminal"):
         # terminal replay -> return stored task unchanged
         _A2A_IDEMPOTENCY[idem_key] = task_id
-        return JSONResponse({"task": _a2a_public_task(task)})
+        return _a2a_json({"task": _a2a_public_task(task)})
 
     data = None
     for p in message.get("parts") or []:
@@ -3519,7 +3524,7 @@ async def _a2a_handle_results(principal, message, msg_hash, idem_key):
     task["status"] = {"state": "TASK_STATE_COMPLETED"}
     task["_terminal"] = True
     _A2A_IDEMPOTENCY[idem_key] = task_id
-    return JSONResponse({"task": _a2a_public_task(task)})
+    return _a2a_json({"task": _a2a_public_task(task)})
 
 
 def _a2a_public_task(task: dict) -> dict:
@@ -3532,14 +3537,14 @@ async def a2a_get_task(task_id: str, request: Request):
     task = _A2A_TASKS[principal].get(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Not found.")
-    return JSONResponse(_a2a_public_task(task))
+    return _a2a_json(_a2a_public_task(task))
 
 
 @app.get(A2A_BASE_PATH + "/tasks")
 async def a2a_list_tasks(request: Request):
     principal = _a2a_check_headers(request)
     tasks = [_a2a_public_task(t) for t in _A2A_TASKS[principal].values()]
-    return JSONResponse({"tasks": tasks})
+    return _a2a_json({"tasks": tasks})
 
 
 @app.post(A2A_BASE_PATH + "/tasks/{task_id}:cancel")
@@ -3552,4 +3557,4 @@ async def a2a_cancel_task(task_id: str, request: Request):
         raise HTTPException(status_code=409, detail="Task already terminal.")
     task["status"] = {"state": "TASK_STATE_CANCELED"}
     task["_terminal"] = True
-    return JSONResponse(_a2a_public_task(task))
+    return _a2a_json(_a2a_public_task(task))
