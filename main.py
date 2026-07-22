@@ -22,7 +22,7 @@ ALLOWED_ORIGINS = {
 
 # Paths that must accept any origin (grader sends from a Cloudflare Worker
 # whose subdomain isn't fixed). CORS reflects whatever Origin arrives.
-PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search", "/extract-graph", "/graph-query", "/community-summary", "/proration")
+PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search", "/extract-graph", "/graph-query", "/community-summary", "/proration", "/guardrail")
 
 # (limit, window_seconds) keyed by path prefix; longest prefix wins.
 PATH_LIMITS: Dict[str, Tuple[int, float]] = {
@@ -41,6 +41,7 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/rank": (10_000, 10.0),
     "/solve": (10_000, 10.0),
     "/proration": (10_000, 10.0),
+    "/guardrail": (10_000, 10.0),
     "/grounded-answer": (10_000, 10.0),
     "/vector-search": (10_000, 10.0),
     "/extract-graph": (10_000, 10.0),
@@ -2202,3 +2203,176 @@ async def proration(request: Request):
 
     charge = (new_price - old_price) * (days_remaining / divisor)
     return {"charge": charge}
+
+
+# ---------- Pre-tool-call guardrail hook ----------
+import posixpath as _pp
+from urllib.parse import urlparse as _urlparse
+
+GR_HOME = "/home/agent"
+GR_CWD = "/home/agent/workspace"
+# The one secret this policy protects.
+GR_SECRET = "/home/agent/.pgpass"
+# Writes are confined to these roots (both spellings accepted).
+GR_WRITE_ROOTS = ("/home/agent/workspace/output", "/workspace/output")
+# Outbound HTTP allowlist -- EXACT hostname match only.
+GR_ALLOWED_HOSTS = {"raw.githubusercontent.com", "huggingface.co"}
+# Classic never-read secrets (the worked example blocks /etc/shadow).
+GR_ALWAYS_BLOCK = {"/etc/shadow", "/etc/gshadow"}
+
+_B64_RE = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
+_PATHISH_RE = re.compile(r"[~$]?[\w./\-${}]*/[\w./\-${}]*|\.[\w.\-]+")
+
+
+def _gr_expand(s: str) -> str:
+    """Expand $HOME/${HOME}/~ and strip quoting used to split literals apart."""
+    if not s:
+        return ""
+    # Remove backslash escapes and quote characters. This defeats tricks like
+    # /home/agent/.pg''pass, /home/agent/.pg\pass, "/home/agent"/.pgpass
+    s = s.replace("\\", "")
+    s = s.replace("'", "").replace('"', "")
+    s = s.replace("${HOME}", GR_HOME).replace("$HOME", GR_HOME)
+    s = re.sub(r"(?<![\w/])~(?=/|$)", GR_HOME, s)
+    return s
+
+
+def _gr_norm(p: str, cwd: str = GR_CWD) -> str:
+    """Normalize a single path: expand, make absolute against cwd, resolve .. and .."""
+    if not p:
+        return ""
+    p = _gr_expand(p).strip()
+    if not p:
+        return ""
+    if not p.startswith("/"):
+        p = _pp.join(cwd, p)
+    return _pp.normpath(p)
+
+
+def _gr_decoded_blobs(text: str):
+    """Yield plausible base64-decoded payloads embedded in a command."""
+    out = []
+    for blob in _B64_RE.findall(text or ""):
+        try:
+            dec = base64.b64decode(blob + "=" * (-len(blob) % 4), validate=False)
+            s = dec.decode("utf-8", "ignore")
+            # Only keep decodings that look like text (avoid binary noise)
+            if s and sum(c.isprintable() or c.isspace() for c in s) / len(s) > 0.85:
+                out.append(s)
+        except Exception:
+            continue
+    return out
+
+
+def _gr_targets_secret(text: str) -> bool:
+    """True if `text` (a shell command or path) references the protected secret
+    in any form: literal, $HOME/~ expansion, or relative traversal."""
+    if not text:
+        return False
+    layers = [text] + _gr_decoded_blobs(text)
+    for layer in layers:
+        exp = _gr_expand(layer)
+        # Fast literal check -- the only reason to name .pgpass is to reach it.
+        if ".pgpass" in exp:
+            return True
+        # Resolve every path-like token against both cwd and home and compare.
+        for tok in _PATHISH_RE.findall(exp):
+            tok = tok.strip().rstrip(":;,")
+            if not tok:
+                continue
+            for base in (GR_CWD, GR_HOME):
+                if _gr_norm(tok, base) == GR_SECRET:
+                    return True
+    return False
+
+
+def _gr_hits_always_block(text: str) -> str:
+    """Return the always-blocked path referenced, if any."""
+    if not text:
+        return ""
+    for layer in [text] + _gr_decoded_blobs(text):
+        exp = _gr_expand(layer)
+        for bad in GR_ALWAYS_BLOCK:
+            if bad in exp:
+                return bad
+            for tok in _PATHISH_RE.findall(exp):
+                if _gr_norm(tok) == bad:
+                    return bad
+    return ""
+
+
+def _gr_write_allowed(path: str) -> bool:
+    """True only if the normalized path lands inside an allowed write root."""
+    norm = _gr_norm(path)
+    if not norm:
+        return False
+    for root in GR_WRITE_ROOTS:
+        if norm == root or norm.startswith(root + "/"):
+            return True
+    return False
+
+
+def _gr_host_allowed(url: str):
+    """Return (allowed, hostname). Exact-match allowlist only."""
+    raw = (url or "").strip()
+    if not raw:
+        return False, ""
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        parsed = _urlparse(raw)
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except Exception:
+        return False, ""
+    if not host:
+        return False, ""
+    return host in GR_ALLOWED_HOSTS, host
+
+
+@app.post("/guardrail")
+async def guardrail(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return {"decision": "block", "reason": "Malformed request body."}
+    if not isinstance(body, dict):
+        return {"decision": "block", "reason": "Malformed request body."}
+
+    tool = str(body.get("tool") or "").strip().lower()
+
+    # ---- bash ----
+    if tool == "bash":
+        cmd = str(body.get("command") or "")
+        if _gr_targets_secret(cmd):
+            return {"decision": "block",
+                    "reason": "Reading /home/agent/.pgpass is never permitted by this agent's policy."}
+        bad = _gr_hits_always_block(cmd)
+        if bad:
+            return {"decision": "block",
+                    "reason": f"Reading {bad} is never permitted by this agent's policy."}
+        return {"decision": "allow",
+                "reason": "Command does not touch the protected secret."}
+
+    # ---- write_file ----
+    if tool == "write_file":
+        path = str(body.get("path") or "")
+        if _gr_targets_secret(path):
+            return {"decision": "block",
+                    "reason": "Writing to /home/agent/.pgpass is never permitted by this agent's policy."}
+        if _gr_write_allowed(path):
+            return {"decision": "allow",
+                    "reason": "Write target is inside the allowed output directory."}
+        return {"decision": "block",
+                "reason": f"Writes are restricted to {GR_WRITE_ROOTS[0]}/; resolved path escapes it."}
+
+    # ---- http_request ----
+    if tool == "http_request":
+        url = str(body.get("url") or "")
+        ok, host = _gr_host_allowed(url)
+        if ok:
+            return {"decision": "allow",
+                    "reason": f"Host {host} is on the outbound allowlist."}
+        return {"decision": "block",
+                "reason": f"Host {host or '(unparseable)'} is not an exact match for an allowlisted host."}
+
+    return {"decision": "block", "reason": f"Unknown tool '{tool}'."}
