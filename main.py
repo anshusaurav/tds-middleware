@@ -2791,16 +2791,16 @@ _rt_seed_files()
 def _rt_norm_path(raw: str) -> str:
     """Normalize a read_file path to an absolute logical path.
 
-    Percent-decoding is applied ONCE (so %2e%2e traversal is resolved), but a
-    filename that literally contains '%2e%2e' as stored on disk is handled by
-    checking the raw form too. Backslashes are treated as separators."""
+    Relative paths are resolved against the sandbox root (so the grader may
+    send either an absolute /srv/... path or a sandbox-relative one).
+    Traversal that escapes the sandbox is still caught by normpath + the
+    later containment check."""
     if not raw:
         return ""
-    p = raw.strip()
-    p = p.replace("\\", "/")
-    # expand ~ / $HOME-style just in case (not part of policy, but safe)
-    p = _pp.normpath(p)
-    return p
+    p = raw.strip().replace("\\", "/")
+    if not p.startswith("/"):
+        p = RT_SANDBOX + "/" + p
+    return _pp.normpath(p)
 
 
 def _rt_inside_sandbox(logical: str) -> bool:
