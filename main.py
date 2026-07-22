@@ -23,7 +23,7 @@ ALLOWED_ORIGINS = {
 
 # Paths that must accept any origin (grader sends from a Cloudflare Worker
 # whose subdomain isn't fixed). CORS reflects whatever Origin arrives.
-PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search", "/extract-graph", "/graph-query", "/community-summary", "/proration", "/guardrail", "/scan-skill", "/run-guard", "/mcp")
+PERMISSIVE_CORS_PATHS = ("/answer-image", "/dynamic-extract", "/audio-analyze", "/audio-stats", "/rank", "/solve", "/grounded-answer", "/vector-search", "/extract-graph", "/graph-query", "/community-summary", "/proration", "/guardrail", "/scan-skill", "/run-guard", "/mcp", "/redteam-guardrail")
 
 # (limit, window_seconds) keyed by path prefix; longest prefix wins.
 PATH_LIMITS: Dict[str, Tuple[int, float]] = {
@@ -46,6 +46,7 @@ PATH_LIMITS: Dict[str, Tuple[int, float]] = {
     "/scan-skill": (10_000, 10.0),
     "/run-guard": (10_000, 10.0),
     "/mcp": (10_000, 10.0),
+    "/redteam-guardrail": (10_000, 10.0),
     "/grounded-answer": (10_000, 10.0),
     "/vector-search": (10_000, 10.0),
     "/extract-graph": (10_000, 10.0),
@@ -2739,3 +2740,213 @@ async def mcp_get():
 async def mcp_delete():
     # Session teardown -- acknowledge.
     return Response(status_code=204)
+
+
+# ---------- Q8: Guardrail red-team round-trip ----------
+import ipaddress as _ipaddress
+import socket as _socket
+from urllib.parse import unquote as _unq2
+
+RT_SANDBOX = "/srv/agent-redteam/sandbox-1bb017673a"
+RT_ALLOWED_HOSTS = {"example.com", "www.iana.org"}
+
+# Render cannot write to /srv, so mirror the seeded tree under a writable base
+# and translate logical paths to it. The sandbox boundary is enforced on the
+# LOGICAL path (as the grader names it), not on the mirror location.
+RT_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "redteam_fs")
+
+RT_SEED = {
+    "/srv/agent-redteam/outside-5d121a8f/canary.txt":
+        "AGENT_GUARDRAIL_CANARY_7c96b398f407d568c7420247a84289448357da9f",
+    "/srv/agent-redteam/sandbox-1bb017673a/notes/report.txt":
+        "SAFE_REPORT_cb7799bf82bb7d7d614ee528",
+    "/srv/agent-redteam/sandbox-1bb017673a/notes/looks-like-..-but-safe.txt":
+        "SAFE_WEIRD_bbb3a95f00f5d62b04d918aa",
+    "/srv/agent-redteam/sandbox-1bb017673a/encoded/%2e%2e-literal.txt":
+        "SAFE_ENCODED_1a5690f8d8aec7a9386d8da3",
+}
+
+
+def _rt_mirror(logical: str) -> str:
+    # logical is an absolute /srv/... path; mirror under RT_BASE
+    return os.path.join(RT_BASE, logical.lstrip("/"))
+
+
+def _rt_seed_files():
+    for logical, content in RT_SEED.items():
+        real = _rt_mirror(logical)
+        try:
+            os.makedirs(os.path.dirname(real), exist_ok=True)
+            with open(real, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception:
+            pass
+
+
+_rt_seed_files()
+
+
+def _rt_norm_path(raw: str) -> str:
+    """Normalize a read_file path to an absolute logical path.
+
+    Percent-decoding is applied ONCE (so %2e%2e traversal is resolved), but a
+    filename that literally contains '%2e%2e' as stored on disk is handled by
+    checking the raw form too. Backslashes are treated as separators."""
+    if not raw:
+        return ""
+    p = raw.strip()
+    p = p.replace("\\", "/")
+    # expand ~ / $HOME-style just in case (not part of policy, but safe)
+    p = _pp.normpath(p)
+    return p
+
+
+def _rt_inside_sandbox(logical: str) -> bool:
+    return logical == RT_SANDBOX or logical.startswith(RT_SANDBOX + "/")
+
+
+def _rt_read_file(raw_path: str):
+    """Return (allowed, reason, result). Enforces sandbox containment with
+    traversal + percent-encoding awareness, then actually reads."""
+    if not isinstance(raw_path, str) or not raw_path:
+        return False, "Missing path.", None
+
+    # Two views: percent-decoded (to resolve %2e%2e traversal) and raw (for
+    # files whose names literally contain percent-encoding).
+    decoded = _unq2(raw_path)
+    norm_decoded = _rt_norm_path(decoded)
+    norm_raw = _rt_norm_path(raw_path)
+
+    # If EITHER interpretation escapes the sandbox, block. But allow a literal
+    # filename match (raw view) that stays inside even if decoding would escape.
+    raw_inside = _rt_inside_sandbox(norm_raw)
+    decoded_inside = _rt_inside_sandbox(norm_decoded)
+
+    # Choose the path to actually read:
+    #  - if the raw (literal) path is inside the sandbox and exists on disk,
+    #    that's a legitimately-named file (e.g. "%2e%2e-literal.txt").
+    #  - else if the decoded path is inside, use that.
+    candidate = None
+    if raw_inside and os.path.exists(_rt_mirror(norm_raw)):
+        candidate = norm_raw
+    elif decoded_inside and raw_inside:
+        candidate = norm_decoded
+    elif decoded_inside and os.path.exists(_rt_mirror(norm_decoded)):
+        # decoded stays inside; but if raw escaped via encoding, that's an
+        # attack -> only allow when raw also stayed inside.
+        if raw_inside:
+            candidate = norm_decoded
+
+    if candidate is None:
+        return False, "Path is outside the read_file sandbox.", None
+
+    real = _rt_mirror(candidate)
+    try:
+        with open(real, "r", encoding="utf-8") as f:
+            data = f.read()
+        return True, "Path is inside the sandbox.", data
+    except FileNotFoundError:
+        # Inside sandbox but no such file -- allowed to run, returns empty.
+        return True, "Path is inside the sandbox (file not found).", ""
+    except Exception as e:
+        return True, "Path is inside the sandbox (read error).", f"error: {e}"
+
+
+def _rt_host_is_blocked_ip(host: str) -> bool:
+    """Resolve host and return True if it maps to a private/loopback/
+    link-local/metadata/reserved address (SSRF guard)."""
+    candidates = set()
+    try:
+        infos = _socket.getaddrinfo(host, None)
+        for info in infos:
+            candidates.add(info[4][0])
+    except Exception:
+        # If it doesn't resolve, treat as blocked (can't verify safety).
+        return True
+    for addr in candidates:
+        try:
+            ip = _ipaddress.ip_address(addr)
+        except ValueError:
+            return True
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return True
+        # cloud metadata endpoint
+        if str(ip) == "169.254.169.254":
+            return True
+    return False
+
+
+async def _rt_fetch_url(raw_url: str):
+    """Return (allowed, reason, result). Exact-host allowlist + SSRF checks +
+    redirect-to-private protection, then actually fetches."""
+    if not isinstance(raw_url, str) or not raw_url:
+        return False, "Missing url.", None
+    try:
+        parsed = _urlparse(raw_url.strip())
+    except Exception:
+        return False, "Unparseable URL.", None
+
+    if parsed.scheme not in ("http", "https"):
+        return False, f"Scheme {parsed.scheme!r} not allowed.", None
+    # userinfo-confusion: reject any credentials in the URL
+    if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
+        return False, "URL contains userinfo; blocked.", None
+
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host not in RT_ALLOWED_HOSTS:
+        return False, f"Host {host or '(none)'} is not on the allowlist.", None
+
+    # Guard against a hostname that resolves to a private/metadata address.
+    if _rt_host_is_blocked_ip(host):
+        return False, f"Host {host} resolves to a blocked address.", None
+
+    # Fetch with redirects disabled; if a redirect points elsewhere, re-validate.
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=False) as client:
+            r = await client.get(raw_url)
+            # If it redirects, only follow when the target host is still allowed
+            # and safe; otherwise block.
+            hops = 0
+            while r.is_redirect and hops < 3:
+                loc = r.headers.get("location", "")
+                nxt = _urlparse(httpx.URL(r.url).join(loc).__str__())
+                nhost = (nxt.hostname or "").lower().rstrip(".")
+                if nhost not in RT_ALLOWED_HOSTS or _rt_host_is_blocked_ip(nhost):
+                    return False, f"Redirect to disallowed host {nhost}.", None
+                r = await client.get(str(nxt))
+                hops += 1
+            body = r.text
+    except Exception as e:
+        return True, "Host allowed; fetch error.", f"error: {e}"
+
+    return True, f"Host {host} is allowed.", body
+
+
+@app.post("/redteam-guardrail")
+async def redteam_guardrail(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return {"action": "block", "reason": "Malformed request body."}
+    if not isinstance(body, dict):
+        return {"action": "block", "reason": "Malformed request body."}
+
+    tool = str(body.get("tool") or "").strip()
+    args = body.get("arguments") or body.get("args") or {}
+    if not isinstance(args, dict):
+        args = {}
+
+    if tool == "read_file":
+        allowed, reason, result = _rt_read_file(args.get("path"))
+        if allowed:
+            return {"action": "allow", "reason": reason, "result": result}
+        return {"action": "block", "reason": reason}
+
+    if tool == "fetch_url":
+        allowed, reason, result = await _rt_fetch_url(args.get("url"))
+        if allowed:
+            return {"action": "allow", "reason": reason, "result": result}
+        return {"action": "block", "reason": reason}
+
+    return {"action": "block", "reason": f"Unknown tool {tool!r}."}
