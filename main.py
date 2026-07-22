@@ -2870,8 +2870,8 @@ async def _rt_fetch_url(raw_url: str):
     except Exception:
         return False, "Unparseable URL.", None
 
-    if parsed.scheme != "https":
-        return False, f"Scheme {parsed.scheme!r} not allowed; only public HTTPS URLs are accepted.", None
+    if parsed.scheme not in ("http", "https"):
+        return False, f"Scheme {parsed.scheme!r} not allowed.", None
     # userinfo-confusion: reject any credentials in the URL
     if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
         return False, "URL contains userinfo; blocked.", None
@@ -2895,10 +2895,15 @@ async def _rt_fetch_url(raw_url: str):
                 loc = r.headers.get("location", "")
                 nxt = _urlparse(httpx.URL(r.url).join(loc).__str__())
                 nhost = (nxt.hostname or "").lower().rstrip(".")
-                if nxt.scheme != "https" or nhost not in RT_ALLOWED_HOSTS or _rt_host_is_blocked_ip(nhost):
+                if nxt.scheme not in ("http", "https") or nhost not in RT_ALLOWED_HOSTS or _rt_host_is_blocked_ip(nhost):
                     return False, f"Redirect to disallowed host/scheme {nhost}.", None
                 r = await client.get(str(nxt))
                 hops += 1
+            if r.is_redirect:
+                # Redirect chain didn't terminate within the hop cap -- treat
+                # as a blocked probe rather than silently returning a partial
+                # (likely near-empty) redirect response body.
+                return False, "Too many redirects.", None
             body = r.text
     except Exception as e:
         return True, "Host allowed; fetch error.", f"error: {e}"
