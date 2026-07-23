@@ -3758,7 +3758,7 @@ async def _inc_plan(body: dict, dbg: dict = None) -> dict:
     tool_names = [t.get("name") for t in catalog if isinstance(t, dict)]
     diag_tools = [n for n in tool_names if n not in effect_tools]
 
-    token = os.environ.get("AIPIPE_TOKEN", "").strip()
+    token = os.environ.get("GEMINI_API_KEY", "").strip()
     plan = None
     if token:
         try:
@@ -3772,41 +3772,56 @@ async def _inc_plan(body: dict, dbg: dict = None) -> dict:
                            ("maximumDiagnostics", "effectTools",
                             "approvalRequiredFor", "doNotExport")},
             }
-            payload = {
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "system", "content": INC_SYSTEM},
-                             {"role": "user",
-                              # Real transcripts run ~45-50k chars; the old 14k-char
-                              # cutoff silently chopped most incidents mid-transcript,
-                              # so the model (or the JSON parse) failed and every run
-                              # fell back to allowed[0]. Give it enough room for the
-                              # full ~80k-token spec'd payload.
-                              "content": _json.dumps(safe_ctx, ensure_ascii=False)[:180000]
-                              + "\n\nReturn the JSON."}],
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
+            # Real transcripts run ~45-50k chars; the old 14k-char cutoff
+            # silently chopped most incidents mid-transcript, so the model
+            # (or the JSON parse) failed and every run fell back to allowed[0].
+            # Give it enough room for the full ~80k-token spec'd payload.
+            user_content = (INC_SYSTEM + "\n\n"
+                             + _json.dumps(safe_ctx, ensure_ascii=False)[:180000]
+                             + "\n\nReturn the JSON.")
+            dbg["llmPromptChars"] = len(user_content)
+            gpayload = {
+                "contents": [{"parts": [{"text": user_content}]}],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "temperature": 0,
+                    "thinkingConfig": {"thinkingBudget": 0},
+                },
             }
-            dbg["llmPromptChars"] = len(payload["messages"][1]["content"])
-            async with httpx.AsyncClient(timeout=16.0) as client:
-                r = await client.post(f"{AIPIPE_BASE}/chat/completions",
-                                      headers={"Authorization": f"Bearer {token}",
-                                               "Content-Type": "application/json"},
-                                      json=payload)
-            dbg["llmHttpStatus"] = r.status_code
-            if r.status_code < 400:
-                raw = r.json()["choices"][0]["message"]["content"].strip()
-                if raw.startswith("```"):
-                    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-                    raw = re.sub(r"\s*```$", "", raw)
-                plan = _json.loads(raw)
-                dbg["llmPlanRaw"] = plan
-            else:
-                dbg["llmErrorBody"] = r.text[:500]
+            errors = []
+            for model_name in ("gemini-2.5-flash", "gemini-2.5-flash-lite"):
+                url = f"{GEMINI_BASE}/models/{model_name}:generateContent?key={token}"
+                try:
+                    async with httpx.AsyncClient(timeout=16.0) as client:
+                        r = await client.post(url, headers={"Content-Type": "application/json"},
+                                              json=gpayload)
+                    dbg["llmHttpStatus"] = r.status_code
+                    if r.status_code >= 400:
+                        errors.append(f"{model_name}: {r.status_code} {r.text[:300]}")
+                        continue
+                    gbody = r.json()
+                    parts = (gbody.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+                    raw = "".join(p.get("text", "") for p in parts).strip()
+                    if raw.startswith("```"):
+                        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                        raw = re.sub(r"\s*```$", "", raw)
+                    candidate = _json.loads(raw)
+                    if not isinstance(candidate, dict):
+                        errors.append(f"{model_name}: non-dict content")
+                        continue
+                    plan = candidate
+                    dbg["llmModel"] = model_name
+                    dbg["llmPlanRaw"] = plan
+                    break
+                except Exception as e:
+                    errors.append(f"{model_name}: {e}")
+            if plan is None and errors:
+                dbg["llmErrorBody"] = " || ".join(errors)[:500]
         except Exception as e:
             dbg["llmException"] = f"{type(e).__name__}: {e}"
             plan = None
     else:
-        dbg["llmSkipped"] = "no AIPIPE_TOKEN"
+        dbg["llmSkipped"] = "no GEMINI_API_KEY"
 
     if not isinstance(plan, dict):
         plan = {}
