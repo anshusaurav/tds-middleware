@@ -15,6 +15,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 EMAIL = "25f1002017@ds.study.iitm.ac.in"
 ANALYTICS_API_KEY = "ak_n6jqafr50nenrfru11eevksj"
+PROCESS_BOOT_ID = uuid.uuid4().hex
+PROCESS_BOOT_TS = time.time()
 
 ALLOWED_ORIGINS = {
     "https://app-b3lmdj.example.com",
@@ -371,6 +373,13 @@ async def work(n: int = Query(1, ge=0, le=1_000_000)):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "uptime_s": max(0.0, time.monotonic() - APP_START)}
+
+
+@app.get("/debug/process")
+async def debug_process():
+    return {"pid": os.getpid(), "boot_id": PROCESS_BOOT_ID,
+            "process_uptime_s": time.time() - PROCESS_BOOT_TS,
+            "inc_runs_count": len(_INC_RUNS)}
 
 
 @app.get("/metrics")
