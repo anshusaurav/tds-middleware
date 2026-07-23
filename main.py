@@ -3704,13 +3704,14 @@ INC_SYSTEM = (
 def _inc_synth_args(schema: dict, incident: dict) -> dict:
     """Best-effort fallback: populate every schema property with a plausible,
     incident-derived value when the model left it empty or missing."""
-    if not isinstance(schema, dict):
-        return {}
-    props = schema.get("properties")
-    if not isinstance(props, dict) or not props:
-        return {}
     service = incident.get("service") or ""
     title = incident.get("title") or "incident"
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(props, dict) or not props:
+        # No declared schema properties to key off of -- still never return
+        # empty: a call with empty arguments is treated as invalid, so fall
+        # back to the one field every tool call can be reasonably scoped by.
+        return {"service": service or title}
     out = {}
     for name, spec in props.items():
         spec = spec if isinstance(spec, dict) else {}
@@ -3822,12 +3823,20 @@ async def _inc_plan(body: dict, dbg: dict = None) -> dict:
 
     max_diag = int(policy.get("maximumDiagnostics") or 3)
     diags = []
+    used_evidence = set()
     for d in (plan.get("diagnostics") or []):
         if isinstance(d, dict) and d.get("toolName") in tool_names \
                 and d.get("toolName") not in effect_tools:
-            de = [e for e in (d.get("evidence") or []) if e in ev]
+            # Spec: "Do not cite duplicate evidence IDs" -- enforced across the
+            # whole dispatch set, not just within one call. Drop any evidence
+            # already claimed by an earlier diagnostic; if that leaves nothing,
+            # assign the next unused ID (round-robin once all are claimed) so
+            # repeated fallbacks don't all pile onto ev[0].
+            de = [e for e in (d.get("evidence") or []) if e in ev and e not in used_evidence]
             if not de:
-                de = ev[:1]
+                unused = [e for e in ev if e not in used_evidence]
+                de = [unused[0]] if unused else [ev[len(diags) % len(ev)]]
+            used_evidence.update(de)
             diags.append({"toolName": d["toolName"],
                           "arguments": _inc_fill_args(d["toolName"], d.get("arguments"),
                                                        catalog_by_name, incident),
