@@ -3743,8 +3743,10 @@ def _inc_fill_args(tool_name, given_args, catalog_by_name, incident):
     return out
 
 
-async def _inc_plan(body: dict) -> dict:
+async def _inc_plan(body: dict, dbg: dict = None) -> dict:
     """Return a plan dict; cached implicitly by being called once per runId."""
+    if dbg is None:
+        dbg = {}
     incident = body.get("incident") or {}
     transcript = incident.get("transcript", "")
     allowed = incident.get("allowedRootCauses") or []
@@ -3773,24 +3775,37 @@ async def _inc_plan(body: dict) -> dict:
                 "model": "gpt-4o-mini",
                 "messages": [{"role": "system", "content": INC_SYSTEM},
                              {"role": "user",
-                              "content": _json.dumps(safe_ctx, ensure_ascii=False)[:14000]
+                              # Real transcripts run ~45-50k chars; the old 14k-char
+                              # cutoff silently chopped most incidents mid-transcript,
+                              # so the model (or the JSON parse) failed and every run
+                              # fell back to allowed[0]. Give it enough room for the
+                              # full ~80k-token spec'd payload.
+                              "content": _json.dumps(safe_ctx, ensure_ascii=False)[:180000]
                               + "\n\nReturn the JSON."}],
                 "temperature": 0,
                 "response_format": {"type": "json_object"},
             }
-            async with httpx.AsyncClient(timeout=14.0) as client:
+            dbg["llmPromptChars"] = len(payload["messages"][1]["content"])
+            async with httpx.AsyncClient(timeout=16.0) as client:
                 r = await client.post(f"{AIPIPE_BASE}/chat/completions",
                                       headers={"Authorization": f"Bearer {token}",
                                                "Content-Type": "application/json"},
                                       json=payload)
+            dbg["llmHttpStatus"] = r.status_code
             if r.status_code < 400:
                 raw = r.json()["choices"][0]["message"]["content"].strip()
                 if raw.startswith("```"):
                     raw = re.sub(r"^```(?:json)?\s*", "", raw)
                     raw = re.sub(r"\s*```$", "", raw)
                 plan = _json.loads(raw)
-        except Exception:
+                dbg["llmPlanRaw"] = plan
+            else:
+                dbg["llmErrorBody"] = r.text[:500]
+        except Exception as e:
+            dbg["llmException"] = f"{type(e).__name__}: {e}"
             plan = None
+    else:
+        dbg["llmSkipped"] = "no AIPIPE_TOKEN"
 
     if not isinstance(plan, dict):
         plan = {}
@@ -3897,7 +3912,7 @@ async def inc_create(request: Request):
     approval_req = set(policy.get("approvalRequiredFor") or [])
     marker = body.get("publicMarker", "")
 
-    plan = await _inc_plan(body)
+    plan = await _inc_plan(body, dbg)
 
     # ---- trace context (continue incoming traceparent if valid) ----
     incoming = request.headers.get("traceparent", "")
