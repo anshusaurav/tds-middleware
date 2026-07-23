@@ -2919,11 +2919,16 @@ async def _rt_fetch_url(raw_url: str):
             hops = 0
             while r.is_redirect and hops < 3:
                 loc = r.headers.get("location", "")
-                nxt = _urlparse(httpx.URL(r.url).join(loc).__str__())
+                joined = httpx.URL(r.url).join(loc)
+                joined_str = str(joined)
+                nxt = _urlparse(joined_str)
                 nhost = (nxt.hostname or "").lower().rstrip(".")
                 if nxt.scheme not in ("http", "https") or nhost not in RT_ALLOWED_HOSTS or _rt_host_is_blocked_ip(nhost):
                     return False, f"Redirect to disallowed host/scheme {nhost}.", None
-                r = await client.get(str(nxt))
+                smuggled_hop = _rt_find_smuggled_host(joined_str)
+                if smuggled_hop:
+                    return False, f"Redirect URL smuggles a reference to disallowed host {smuggled_hop!r}.", None
+                r = await client.get(joined_str)
                 hops += 1
             if r.is_redirect:
                 # Redirect chain didn't terminate within the hop cap -- treat
