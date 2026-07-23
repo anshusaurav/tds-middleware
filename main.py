@@ -3663,6 +3663,7 @@ async def a2a_cancel_task(task_id: str, request: Request):
 # ---------- Q11: Observable Incident Agent ----------
 INC_PROFILE = "ga5-incident-agent/v2"
 _INC_RUNS: Dict[str, dict] = {}
+_INC_DEBUG_LOG = deque(maxlen=60)
 
 
 def _inc_trace_id() -> str:
@@ -3842,16 +3843,40 @@ def _inc_public(run: dict) -> dict:
 
 @app.post("/v2/incidents")
 async def inc_create(request: Request):
+    dbg = {"ts": time.time(), "route": "create"}
     try:
         body = await request.json()
     except Exception:
+        dbg["outcome"] = "400 malformed json"
+        _INC_DEBUG_LOG.append(dbg)
         raise HTTPException(status_code=400, detail="Malformed JSON.")
     if not isinstance(body, dict):
+        dbg["outcome"] = "400 body not object"
+        _INC_DEBUG_LOG.append(dbg)
         raise HTTPException(status_code=400, detail="Body must be object.")
+    dbg["profile"] = body.get("profile")
+    dbg["runId"] = body.get("runId")
+    inc = body.get("incident") or {}
+    dbg["incidentId"] = inc.get("incidentId")
+    dbg["service"] = inc.get("service")
+    dbg["severity"] = inc.get("severity")
+    dbg["allowedRootCauses"] = inc.get("allowedRootCauses")
+    dbg["transcriptLen"] = len(inc.get("transcript") or "")
+    dbg["evidenceIdsFound"] = _inc_evidence_ids(inc.get("transcript") or "")[:15]
+    dbg["evidenceIdsCount"] = len(_inc_evidence_ids(inc.get("transcript") or ""))
+    catalog = body.get("toolCatalog") or []
+    dbg["toolNames"] = [t.get("name") for t in catalog if isinstance(t, dict)]
+    policy = body.get("policy") or {}
+    dbg["policy"] = policy
+    dbg["hasSensitive"] = "sensitive" in body
     if body.get("profile") != INC_PROFILE:
+        dbg["outcome"] = f"422 unsupported profile {body.get('profile')!r}"
+        _INC_DEBUG_LOG.append(dbg)
         raise HTTPException(status_code=422, detail="Unsupported profile.")
     run_id = body.get("runId")
     if not isinstance(run_id, str) or not run_id:
+        dbg["outcome"] = "422 missing runId"
+        _INC_DEBUG_LOG.append(dbg)
         raise HTTPException(status_code=422, detail="Missing runId.")
 
     # content hash excluding sensitive (which we never persist/echo)
@@ -3861,7 +3886,11 @@ async def inc_create(request: Request):
     existing = _INC_RUNS.get(run_id)
     if existing is not None:
         if existing["chash"] == chash:
+            dbg["outcome"] = "200 replay"
+            _INC_DEBUG_LOG.append(dbg)
             return JSONResponse(existing["response_initial"])  # replay
+        dbg["outcome"] = "409 runId content changed"
+        _INC_DEBUG_LOG.append(dbg)
         raise HTTPException(status_code=409, detail="runId content changed.")
 
     policy = body.get("policy") or {}
@@ -3918,6 +3947,13 @@ async def inc_create(request: Request):
         "diag_failed": False, "join_needed": len(dispatches) > 1,
         "model_name": "gpt-4o-mini",
     }
+    dbg["outcome"] = "200 created"
+    dbg["rootCause"] = plan["rootCause"]
+    dbg["evidenceChosen"] = plan["evidence"]
+    dbg["dispatches"] = [{"toolName": d["toolName"], "actionId": d["actionId"],
+                           "arguments": d["arguments"], "evidence": d["evidence"]} for d in dispatches]
+    dbg["effectPlanned"] = plan["effect"]
+    _INC_DEBUG_LOG.append(dbg)
     return JSONResponse(response_initial)
 
 
@@ -4055,11 +4091,35 @@ def _inc_finalize(run: dict, run_id: str):
 
 @app.post("/v2/incidents/{run_id}/receipts")
 async def inc_receipts(run_id: str, request: Request):
+    body_bytes = await request.body()
+    dbg = {"ts": time.time(), "route": "receipts", "runId": run_id}
+    try:
+        dbg["body"] = _json.loads(body_bytes) if body_bytes else None
+    except Exception:
+        dbg["body"] = "<unparsable>"
+    try:
+        resp = await _inc_receipts_impl(run_id, body_bytes)
+        try:
+            parsed_resp = _json.loads(resp.body)
+            dbg["responseStatus"] = parsed_resp.get("status")
+            dbg["responseBody"] = parsed_resp
+        except Exception:
+            pass
+        dbg["outcome"] = f"{resp.status_code}"
+        _INC_DEBUG_LOG.append(dbg)
+        return resp
+    except HTTPException as e:
+        dbg["outcome"] = f"{e.status_code} {e.detail}"
+        _INC_DEBUG_LOG.append(dbg)
+        raise
+
+
+async def _inc_receipts_impl(run_id: str, body_bytes: bytes):
     run = _INC_RUNS.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Unknown runId.")
     try:
-        body = await request.json()
+        body = _json.loads(body_bytes) if body_bytes else None
     except Exception:
         raise HTTPException(status_code=400, detail="Malformed JSON.")
     if not isinstance(body, dict) or not isinstance(body.get("receiptId"), str) or not body.get("receiptId"):
@@ -4176,6 +4236,13 @@ async def inc_receipts(run_id: str, request: Request):
     resp = {"runId": run_id, "status": "waiting", "dispatches": [], "approvals": []}
     run["_last_waiting"] = resp
     return JSONResponse(resp)
+
+
+@app.get("/v2/incidents-debug")
+async def inc_debug(key: str = ""):
+    if key != EMAIL:
+        raise HTTPException(status_code=404)
+    return {"count": len(_INC_DEBUG_LOG), "log": list(_INC_DEBUG_LOG)}
 
 
 @app.post("/v2/incidents/{run_id}/{sub}")
