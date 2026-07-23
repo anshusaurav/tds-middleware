@@ -2860,6 +2860,28 @@ def _rt_host_is_blocked_ip(host: str) -> bool:
     return False
 
 
+_RT_EMBEDDED_URL_RE = re.compile(r'https?://([^/\s&#?]+)', re.IGNORECASE)
+
+
+def _rt_find_smuggled_host(raw_url: str):
+    """Decode (repeatedly, to unwrap nested percent-encoding) and scan for any
+    embedded absolute http(s) URL other than the outer allowed one -- e.g. a
+    `next=`/`q=`/`url=` query value smuggling a private/metadata target
+    through an otherwise-allowed host (SSRF via redirect/proxy parameter).
+    Returns the first disallowed embedded host, or None."""
+    decoded = raw_url
+    for _ in range(4):
+        nxt = _unq2(decoded)
+        if nxt == decoded:
+            break
+        decoded = nxt
+    for m in _RT_EMBEDDED_URL_RE.finditer(decoded):
+        host = m.group(1).split(':')[0].split('@')[-1].lower().rstrip('.')
+        if host not in RT_ALLOWED_HOSTS:
+            return host
+    return None
+
+
 async def _rt_fetch_url(raw_url: str):
     """Return (allowed, reason, result). Exact-host allowlist + SSRF checks +
     redirect-to-private protection, then actually fetches."""
@@ -2872,6 +2894,10 @@ async def _rt_fetch_url(raw_url: str):
 
     if parsed.scheme not in ("http", "https"):
         return False, f"Scheme {parsed.scheme!r} not allowed.", None
+
+    smuggled = _rt_find_smuggled_host(raw_url)
+    if smuggled:
+        return False, f"URL smuggles a reference to disallowed host {smuggled!r} (possible SSRF via redirect/proxy parameter).", None
     # userinfo-confusion: reject any credentials in the URL
     if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
         return False, "URL contains userinfo; blocked.", None
