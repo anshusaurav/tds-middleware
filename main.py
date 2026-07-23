@@ -2911,13 +2911,18 @@ async def _rt_fetch_url(raw_url: str):
     return True, f"Host {host} is allowed.", body
 
 
+_RT_DEBUG_LOG = deque(maxlen=100)
+
+
 @app.post("/redteam-guardrail")
 async def redteam_guardrail(request: Request):
     try:
         body = await request.json()
     except Exception:
+        _RT_DEBUG_LOG.append({"ts": time.time(), "body": None, "result": {"action": "block", "reason": "Malformed request body."}})
         return {"action": "block", "reason": "Malformed request body."}
     if not isinstance(body, dict):
+        _RT_DEBUG_LOG.append({"ts": time.time(), "body": body, "result": {"action": "block", "reason": "Malformed request body."}})
         return {"action": "block", "reason": "Malformed request body."}
 
     tool = str(body.get("tool") or "").strip()
@@ -2938,22 +2943,29 @@ async def redteam_guardrail(request: Request):
 
     path, path_conflict = _rt_pick("path")
     url, url_conflict = _rt_pick("url")
+
+    result = None
     if path_conflict or url_conflict:
-        return {"action": "block", "reason": "Conflicting duplicate arguments (possible smuggling)."}
+        result = {"action": "block", "reason": "Conflicting duplicate arguments (possible smuggling)."}
+    elif tool == "read_file":
+        allowed, reason, out = _rt_read_file(path)
+        result = {"action": "allow", "reason": reason, "result": out} if allowed else {"action": "block", "reason": reason}
+    elif tool == "fetch_url":
+        allowed, reason, out = await _rt_fetch_url(url)
+        result = {"action": "allow", "reason": reason, "result": out} if allowed else {"action": "block", "reason": reason}
+    else:
+        result = {"action": "block", "reason": f"Unknown tool {tool!r}."}
 
-    if tool == "read_file":
-        allowed, reason, result = _rt_read_file(path)
-        if allowed:
-            return {"action": "allow", "reason": reason, "result": result}
-        return {"action": "block", "reason": reason}
+    _RT_DEBUG_LOG.append({"ts": time.time(), "body": body,
+                           "result": {"action": result["action"], "reason": result.get("reason")}})
+    return result
 
-    if tool == "fetch_url":
-        allowed, reason, result = await _rt_fetch_url(url)
-        if allowed:
-            return {"action": "allow", "reason": reason, "result": result}
-        return {"action": "block", "reason": reason}
 
-    return {"action": "block", "reason": f"Unknown tool {tool!r}."}
+@app.get("/redteam-guardrail/debug")
+async def redteam_guardrail_debug(key: str = ""):
+    if key != EMAIL:
+        raise HTTPException(status_code=404)
+    return {"count": len(_RT_DEBUG_LOG), "log": list(_RT_DEBUG_LOG)}
 
 
 # ---------- Q9: Safe AI Mailroom Agent (propose/commit) ----------
