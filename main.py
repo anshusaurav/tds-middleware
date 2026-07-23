@@ -4151,6 +4151,12 @@ async def inc_receipts(run_id: str, request: Request):
         dbg["outcome"] = f"{e.status_code} {e.detail}"
         _INC_DEBUG_LOG.append(dbg)
         raise
+    except Exception as e:
+        import traceback
+        dbg["outcome"] = f"500 UNHANDLED {type(e).__name__}: {e}"
+        dbg["traceback"] = traceback.format_exc()[-2000:]
+        _INC_DEBUG_LOG.append(dbg)
+        raise
 
 
 async def _inc_receipts_impl(run_id: str, body_bytes: bytes):
