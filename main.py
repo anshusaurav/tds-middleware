@@ -3882,7 +3882,7 @@ def _inc_public(run: dict) -> dict:
 
 @app.post("/v2/incidents")
 async def inc_create(request: Request):
-    dbg = {"ts": time.time(), "route": "create"}
+    dbg = {"ts": time.time(), "route": "create", "bootId": PROCESS_BOOT_ID}
     try:
         body = await request.json()
     except Exception:
@@ -4131,7 +4131,7 @@ def _inc_finalize(run: dict, run_id: str):
 @app.post("/v2/incidents/{run_id}/receipts")
 async def inc_receipts(run_id: str, request: Request):
     body_bytes = await request.body()
-    dbg = {"ts": time.time(), "route": "receipts", "runId": run_id}
+    dbg = {"ts": time.time(), "route": "receipts", "runId": run_id, "bootId": PROCESS_BOOT_ID}
     try:
         dbg["body"] = _json.loads(body_bytes) if body_bytes else None
     except Exception:
@@ -4287,7 +4287,8 @@ async def _inc_receipts_impl(run_id: str, body_bytes: bytes):
 async def inc_debug(key: str = ""):
     if key != EMAIL:
         raise HTTPException(status_code=404)
-    return {"count": len(_INC_DEBUG_LOG), "log": list(_INC_DEBUG_LOG)}
+    return {"count": len(_INC_DEBUG_LOG), "bootId": PROCESS_BOOT_ID,
+            "totalRunsInMemory": len(_INC_RUNS), "log": list(_INC_DEBUG_LOG)}
 
 
 @app.post("/v2/incidents/{run_id}/{sub}")
