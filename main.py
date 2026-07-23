@@ -3441,37 +3441,78 @@ def _a2a_check_headers(request: Request):
     return principal
 
 
+_A2A_DEBUG_LOG = deque(maxlen=80)
+
+
 @app.post(A2A_BASE_PATH + "/message:send")
 async def a2a_message_send(request: Request):
-    principal = _a2a_check_headers(request)
+    dbg = {"ts": time.time(), "headers": {
+        "authorization": request.headers.get("authorization", "")[:20] + "...",
+        "a2a-version": request.headers.get("a2a-version"),
+        "content-type": request.headers.get("content-type")}}
     try:
+        principal = _a2a_check_headers(request)
         body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Malformed JSON.")
-    message = body.get("message") or {}
-    msg_id = message.get("messageId")
-    if not msg_id:
-        raise HTTPException(status_code=400, detail="Missing messageId.")
+        message = body.get("message") or {}
+        msg_id = message.get("messageId")
+        dbg["principal"] = principal[:12] + "..." if principal else principal
+        dbg["messageId"] = msg_id
+        dbg["taskId"] = message.get("taskId")
+        if not msg_id:
+            dbg["outcome"] = "400 missing messageId"
+            _A2A_DEBUG_LOG.append(dbg)
+            raise HTTPException(status_code=400, detail="Missing messageId.")
 
-    msg_hash = _sha256_hex(_canon(message))
-    idem_key = principal + "|" + str(msg_id)
+        msg_hash = _sha256_hex(_canon(message))
+        idem_key = principal + "|" + str(msg_id)
+        dbg["msgHash"] = msg_hash[:12]
+        dbg["idemKeyPresent"] = idem_key in _A2A_IDEMPOTENCY
 
-    # idempotency: same messageId
-    if idem_key in _A2A_IDEMPOTENCY:
-        prior_task_id = _A2A_IDEMPOTENCY[idem_key]
-        prior = _A2A_TASKS[principal].get(prior_task_id)
-        if prior is not None:
-            if prior.get("_msgHash") == msg_hash:
-                return _a2a_json({"task": _a2a_public_task(prior)})
-            raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
+        if idem_key in _A2A_IDEMPOTENCY:
+            prior_task_id = _A2A_IDEMPOTENCY[idem_key]
+            prior = _A2A_TASKS[principal].get(prior_task_id)
+            dbg["priorTaskId"] = prior_task_id
+            dbg["priorFound"] = prior is not None
+            if prior is not None:
+                dbg["priorMsgHash"] = (prior.get("_msgHash") or "")[:12]
+                if prior.get("_msgHash") == msg_hash:
+                    dbg["outcome"] = "200 replay"
+                    _A2A_DEBUG_LOG.append(dbg)
+                    return _a2a_json({"task": _a2a_public_task(prior)})
+                dbg["outcome"] = "409 IDEMPOTENCY_CONFLICT"
+                _A2A_DEBUG_LOG.append(dbg)
+                raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
 
-    parts = message.get("parts") or []
-    # Determine whether this is an initial batch or a results continuation.
-    is_results = any((p.get("mediaType") == A2A_RESULTS_MODE) for p in parts if isinstance(p, dict))
+        parts = message.get("parts") or []
+        is_results = any((p.get("mediaType") == A2A_RESULTS_MODE) for p in parts if isinstance(p, dict))
+        dbg["isResults"] = is_results
+        dbg["partsMediaTypes"] = [p.get("mediaType") for p in parts if isinstance(p, dict)]
 
-    if is_results:
-        return await _a2a_handle_results(principal, message, msg_hash, idem_key)
-    return await _a2a_handle_initial(principal, message, msg_hash, idem_key)
+        if is_results:
+            resp = await _a2a_handle_results(principal, message, msg_hash, idem_key)
+        else:
+            resp = await _a2a_handle_initial(principal, message, msg_hash, idem_key)
+        dbg["outcome"] = f"{resp.status_code} ok"
+        _A2A_DEBUG_LOG.append(dbg)
+        return resp
+    except HTTPException as e:
+        if "outcome" not in dbg:
+            dbg["outcome"] = f"{e.status_code} {e.detail}"
+            _A2A_DEBUG_LOG.append(dbg)
+        raise
+    except Exception as e:
+        dbg["outcome"] = f"EXC {type(e).__name__}: {e}"
+        _A2A_DEBUG_LOG.append(dbg)
+        raise
+
+
+@app.get(A2A_BASE_PATH + "/debug")
+async def a2a_debug(key: str = ""):
+    if key != EMAIL:
+        raise HTTPException(status_code=404)
+    return {"count": len(_A2A_DEBUG_LOG), "log": list(_A2A_DEBUG_LOG),
+            "idempotency_keys": len(_A2A_IDEMPOTENCY),
+            "task_principals": {p[:12] + "...": len(t) for p, t in _A2A_TASKS.items()}}
 
 
 async def _a2a_handle_initial(principal, message, msg_hash, idem_key):
