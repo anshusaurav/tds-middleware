@@ -3324,7 +3324,7 @@ def _a2a_json(payload, status_code: int = 200):
 
 # principal -> {taskId -> task}, plus idempotency and content caches
 _A2A_TASKS: Dict[str, Dict[str, dict]] = defaultdict(dict)
-_A2A_IDEMPOTENCY: Dict[str, str] = {}          # (principal|messageHash) -> taskId
+_A2A_IDEMPOTENCY: Dict[str, tuple] = {}        # (principal|messageId) -> (taskId, msgHash)
 _A2A_PKG_CACHE: Dict[str, dict] = {}           # canonical package -> decision
 
 
@@ -3469,13 +3469,13 @@ async def a2a_message_send(request: Request):
         dbg["idemKeyPresent"] = idem_key in _A2A_IDEMPOTENCY
 
         if idem_key in _A2A_IDEMPOTENCY:
-            prior_task_id = _A2A_IDEMPOTENCY[idem_key]
+            prior_task_id, prior_hash = _A2A_IDEMPOTENCY[idem_key]
             prior = _A2A_TASKS[principal].get(prior_task_id)
             dbg["priorTaskId"] = prior_task_id
             dbg["priorFound"] = prior is not None
             if prior is not None:
-                dbg["priorMsgHash"] = (prior.get("_msgHash") or "")[:12]
-                if prior.get("_msgHash") == msg_hash:
+                dbg["priorMsgHash"] = (prior_hash or "")[:12]
+                if prior_hash == msg_hash:
                     dbg["outcome"] = "200 replay"
                     _A2A_DEBUG_LOG.append(dbg)
                     return _a2a_json({"task": _a2a_public_task(prior)})
@@ -3567,7 +3567,7 @@ async def _a2a_handle_initial(principal, message, msg_hash, idem_key):
         "_terminal": False,
     }
     _A2A_TASKS[principal][task_id] = task
-    _A2A_IDEMPOTENCY[idem_key] = task_id
+    _A2A_IDEMPOTENCY[idem_key] = (task_id, msg_hash)
     return _a2a_json({"task": _a2a_public_task(task)})
 
 
@@ -3580,7 +3580,7 @@ async def _a2a_handle_results(principal, message, msg_hash, idem_key):
         raise HTTPException(status_code=409, detail="Context mismatch.")
     if task.get("_terminal"):
         # terminal replay -> return stored task unchanged
-        _A2A_IDEMPOTENCY[idem_key] = task_id
+        _A2A_IDEMPOTENCY[idem_key] = (task_id, msg_hash)
         return _a2a_json({"task": _a2a_public_task(task)})
 
     data = None
@@ -3614,7 +3614,7 @@ async def _a2a_handle_results(principal, message, msg_hash, idem_key):
     task["history"].append(message)
     task["status"] = {"state": "TASK_STATE_COMPLETED"}
     task["_terminal"] = True
-    _A2A_IDEMPOTENCY[idem_key] = task_id
+    _A2A_IDEMPOTENCY[idem_key] = (task_id, msg_hash)
     return _a2a_json({"task": _a2a_public_task(task)})
 
 
